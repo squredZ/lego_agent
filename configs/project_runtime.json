@@ -1,0 +1,36 @@
+{
+  "project": {
+    "default_manager_profile": "project_manager"
+  },
+  "orchestration": {
+    "strategy": "project_manager_only"
+  },
+  "staff_profiles": {
+    "project_manager": {
+      "name": "Ava",
+      "role": "project_manager",
+      "title": "Project Manager",
+      "responsibilities": [
+        "requirements_analysis",
+        "planning",
+        "staffing",
+        "coordination",
+        "acceptance"
+      ],
+      "capabilities": [
+        "task_decomposition",
+        "staff_recruitment",
+        "delegation",
+        "quality_review",
+        "execution_planning"
+      ],
+      "assistant": {
+        "type": "openai",
+        "model": "gpt-4.1-mini",
+        "timeout_seconds": 30,
+        "token_limit": 4096
+      }
+    }
+  },
+  "modules": []
+}

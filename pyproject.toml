@@ -1,0 +1,25 @@
+[project]
+name = "lego-agent"
+version = "0.1.0"
+description = "Configurable staff-oriented agent framework."
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.0",
+    "openai>=1.0.0",
+    "pydantic>=2.7.4",
+]
+
+[project.scripts]
+lego-agent = "lego_agent.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["lego_agent*"]
