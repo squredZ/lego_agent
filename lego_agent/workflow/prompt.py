@@ -1,6 +1,20 @@
 from __future__ import annotations
 
-from lego_agent.core.models import Message, Project, SkillSpec, Staff, Task, ToolSpec, WorkContext
+import json
+import logging
+
+from lego_agent.core.models import (
+    Message,
+    OutputContract,
+    Project,
+    SkillSpec,
+    Staff,
+    Task,
+    ToolSpec,
+    WorkContext,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class DefaultPromptBuilder:
@@ -19,9 +33,22 @@ class DefaultPromptBuilder:
         context: WorkContext,
         skills: list[SkillSpec],
         tools: list[ToolSpec],
+        output_contract: OutputContract | None = None,
     ) -> list[Message]:
+        logger.debug(
+            "building assistant messages",
+            extra={
+                "project_id": project.id,
+                "staff_id": staff.id,
+                "task_id": task.id,
+                "skill_count": len(skills),
+                "tool_count": len(tools),
+                "has_output_contract": output_contract is not None,
+            },
+        )
         skill_text = "\n".join(f"- {item.name}: {item.instructions}" for item in skills)
         tool_text = "\n".join(f"- {item.name}: {item.description}" for item in tools)
+        contract_text = self._format_output_contract(output_contract)
         return [
             Message(
                 role="system",
@@ -40,10 +67,31 @@ class DefaultPromptBuilder:
                     f"Memory context:\n{context.memory_context or 'none'}\n\n"
                     f"Selected skills:\n{skill_text or 'none'}\n\n"
                     f"Available tools:\n{tool_text or 'none'}\n\n"
-                    "Return JSON with keys: summary, project_understanding, "
-                    "assumptions, risks, staffing_plan, task_breakdown, "
-                    "execution_plan, final_output. staffing_plan must contain "
-                    "required_roles and rationale."
+                    f"{contract_text}"
                 ),
             ),
         ]
+
+    def _format_output_contract(self, output_contract: OutputContract | None) -> str:
+        if output_contract is None:
+            logger.debug("using default project result output instructions")
+            return (
+                "Return JSON with keys: summary, project_understanding, "
+                "assumptions, risks, staffing_plan, task_breakdown, "
+                "execution_plan, final_output. staffing_plan must contain "
+                "required_roles and rationale."
+            )
+        schema_json = json.dumps(output_contract.json_schema, indent=2, sort_keys=True)
+        logger.debug(
+            "formatting output contract",
+            extra={
+                "output_contract": output_contract.name,
+                "schema_key_count": len(output_contract.json_schema),
+            },
+        )
+        return (
+            f"Output contract: {output_contract.name}\n"
+            f"{output_contract.instructions}\n\n"
+            "Return only valid JSON matching this JSON schema:\n"
+            f"{schema_json}"
+        )

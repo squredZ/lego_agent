@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,8 @@ from lego_agent.core.models import (
     StaffRolePlan,
     StaffingPlan,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -34,6 +37,15 @@ class OpenAIAssistant:
     def respond(self, request: AssistantRequest) -> AssistantResponse:
         """Return a model response or deterministic dry-run response."""
         if self._should_dry_run():
+            logger.info(
+                "assistant using dry-run response",
+                extra={
+                    "project_id": request.project.id,
+                    "staff_id": request.staff.id,
+                    "task_id": request.task.id,
+                    "model": self.model,
+                },
+            )
             return self._dry_run_response(request)
 
         from openai import OpenAI
@@ -41,6 +53,18 @@ class OpenAIAssistant:
         client_kwargs: dict[str, Any] = {}
         api_key = self._effective_api_key()
         base_url = self._effective_base_url()
+        logger.info(
+            "assistant calling OpenAI-compatible API",
+            extra={
+                "project_id": request.project.id,
+                "staff_id": request.staff.id,
+                "task_id": request.task.id,
+                "model": self.model,
+                "has_api_key": bool(api_key),
+                "has_base_url": bool(base_url),
+                "timeout_seconds": self.timeout_seconds,
+            },
+        )
         if api_key:
             client_kwargs["api_key"] = api_key
         if base_url:
@@ -50,6 +74,16 @@ class OpenAIAssistant:
 
         client = OpenAI(**client_kwargs)
         response = client.responses.create(**self._response_kwargs(request))
+        logger.info(
+            "assistant received OpenAI-compatible response",
+            extra={
+                "project_id": request.project.id,
+                "staff_id": request.staff.id,
+                "task_id": request.task.id,
+                "model": self.model,
+                "content_length": len(response.output_text),
+            },
+        )
         return AssistantResponse(content=response.output_text, raw=response)
 
     def _response_kwargs(self, request: AssistantRequest) -> dict[str, Any]:
@@ -73,6 +107,16 @@ class OpenAIAssistant:
             kwargs["reasoning"] = {"effort": self.reasoning_effort}
         if self.thinking:
             kwargs["extra_body"] = {"thinking": self.thinking}
+        logger.debug(
+            "built OpenAI-compatible response kwargs",
+            extra={
+                "model": self.model,
+                "has_token_limit": self.token_limit is not None,
+                "has_reasoning_effort": bool(self.reasoning_effort),
+                "has_thinking": bool(self.thinking),
+                "message_count": len(kwargs["input"]),
+            },
+        )
         return kwargs
 
     def _should_dry_run(self) -> bool:
@@ -148,6 +192,15 @@ class OpenAIAssistant:
                 "Track task completion and review deliverables.",
             ],
             final_output=f"[dry-run:{self.model}] Project manager handled '{task.goal}'.",
+        )
+        logger.debug(
+            "assistant dry-run response built",
+            extra={
+                "project_id": project.id,
+                "staff_id": staff.id,
+                "task_id": task.id,
+                "model": self.model,
+            },
         )
         return AssistantResponse(
             content=project_result.model_dump_json(),

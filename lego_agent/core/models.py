@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 def new_id() -> str:
@@ -40,6 +43,12 @@ class StaffStatus(StrEnum):
     WORKING = "working"
     BLOCKED = "blocked"
     OFFLINE = "offline"
+
+
+class EventLevel(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
 
 
 class ProjectError(BaseModel):
@@ -89,6 +98,10 @@ class Staff(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def assign(self, task: Task) -> None:
+        logger.debug(
+            "staff assigned task",
+            extra={"project_id": self.project_id, "staff_id": self.id, "task_id": task.id},
+        )
         self.current_task_id = task.id
         self.status = StaffStatus.WORKING
         task.status = TaskStatus.IN_PROGRESS
@@ -96,6 +109,15 @@ class Staff(BaseModel):
         task.started_at = utc_now()
 
     def complete(self, task: Task, result: str) -> str:
+        logger.debug(
+            "staff completed task",
+            extra={
+                "project_id": self.project_id,
+                "staff_id": self.id,
+                "task_id": task.id,
+                "result_length": len(result),
+            },
+        )
         task.status = TaskStatus.DONE
         task.result = result
         self.status = StaffStatus.IDLE
@@ -121,6 +143,7 @@ class Task(BaseModel):
     updated_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    events: list[TaskEvent] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -149,6 +172,14 @@ class ProjectResult(BaseModel):
     final_output: str
 
 
+class OutputContract(BaseModel):
+    """Describes the structured output expected from an assistant."""
+
+    name: str
+    json_schema: dict[str, Any]
+    instructions: str
+
+
 class Project(BaseModel):
     """Top-level runtime aggregate.
 
@@ -172,6 +203,7 @@ class Project(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime | None = None
     completed_at: datetime | None = None
+    events: list[ProjectEvent] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -200,6 +232,7 @@ class ProjectRunResult(BaseModel):
     manager_name: str
     result: ProjectResult | None = None
     error: ProjectError | None = None
+    events: list[ProjectEvent] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
     duration_ms: int | None = None
@@ -219,6 +252,30 @@ class WorkContext(BaseModel):
     variables: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectEvent(BaseModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str
+    type: str
+    message: str
+    level: EventLevel = EventLevel.INFO
+    actor_id: str | None = None
+    task_id: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class TaskEvent(BaseModel):
+    id: str = Field(default_factory=new_id)
+    project_id: str
+    task_id: str
+    type: str
+    message: str
+    level: EventLevel = EventLevel.INFO
+    actor_id: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class Message(BaseModel):
     role: str
     content: str
@@ -232,6 +289,7 @@ class AssistantRequest(BaseModel):
     task: Task
     context: WorkContext
     messages: list[Message] = Field(default_factory=list)
+    output_contract: OutputContract | None = None
     output_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 

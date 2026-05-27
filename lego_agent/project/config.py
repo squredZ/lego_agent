@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class AssistantConfig(BaseModel):
@@ -94,10 +97,33 @@ class ProjectRuntimeConfig(BaseModel):
 
 
 def load_project_runtime_config(path: Path) -> ProjectRuntimeConfig:
+    """Load and validate runtime config from a JSON file."""
+    logger.info("loading project runtime config", extra={"config_path": str(path)})
     with path.open("r", encoding="utf-8") as file:
         raw = json.load(file)
-    return parse_project_runtime_config(raw)
+    config = parse_project_runtime_config(raw)
+    logger.info(
+        "project runtime config loaded",
+        extra={
+            "config_path": str(path),
+            "staff_profile_count": len(config.staff_profiles),
+            "module_count": len(config.modules),
+            "orchestration_strategy": config.orchestration.strategy,
+        },
+    )
+    return config
 
 
 def parse_project_runtime_config(raw: dict[str, Any]) -> ProjectRuntimeConfig:
-    return ProjectRuntimeConfig.model_validate(raw)
+    """Validate an already-loaded config dictionary."""
+    logger.debug("validating project runtime config")
+    config = ProjectRuntimeConfig.model_validate(raw)
+    logger.debug(
+        "project runtime config validated",
+        extra={
+            "staff_profile_count": len(config.staff_profiles),
+            "module_count": len(config.modules),
+            "orchestration_strategy": config.orchestration.strategy,
+        },
+    )
+    return config

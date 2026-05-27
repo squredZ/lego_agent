@@ -1,8 +1,10 @@
-"""Configurable staff-oriented agent framework."""
+"""Project-oriented agent framework."""
 
 from lego_agent.core.models import (
     Capability,
+    EventLevel,
     Project,
+    ProjectEvent,
     ProjectResult,
     ProjectRunResult,
     ProjectStatus,
@@ -10,12 +12,16 @@ from lego_agent.core.models import (
     Staff,
     StaffStatus,
     Task,
+    TaskEvent,
     TaskStatus,
+    WorkContext,
 )
 
 __all__ = [
     "Capability",
+    "EventLevel",
     "Project",
+    "ProjectEvent",
     "ProjectResult",
     "ProjectRunResult",
     "ProjectStatus",
@@ -23,5 +29,7 @@ __all__ = [
     "Staff",
     "StaffStatus",
     "Task",
+    "TaskEvent",
     "TaskStatus",
+    "WorkContext",
 ]

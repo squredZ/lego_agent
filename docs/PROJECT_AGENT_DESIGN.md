@@ -28,10 +28,13 @@ The previous `Organization` concept is removed. A project may contain a staff gr
 6. First version is project-manager-only
    Version 1 does not dynamically create and run recruited staff. The project manager outputs a `staffing_plan`. Dynamic staff creation and multi-staff execution are deferred to Version 2.
 
+7. Runtime behavior should be observable
+   Important lifecycle transitions, staff work steps, task state changes, and failures should produce clear logs or structured events. Logs and events must help beginners understand what happened without exposing secrets such as API keys or tokens.
+
 ## 2.1 Concept Overview
 
 ```mermaid
-flowchart TD
+graph TD
     User[User Project Goal] --> Runtime[ProjectRuntime]
     Runtime --> Project[Project]
     Project --> PM[Primary Project Manager Staff]
@@ -39,7 +42,7 @@ flowchart TD
     Workflow --> Result[ProjectRunResult]
 
     PM --> StaffingPlan[StaffingPlan]
-    StaffingPlan -. Version 2 .-> RecruitedStaff[Recruited Staff]
+    StaffingPlan -. "Version 2" .-> RecruitedStaff[Recruited Staff]
 
     subgraph StaffModel[Unified Staff Model]
         PM
@@ -129,79 +132,24 @@ class Project(BaseModel):
 ### 4.1.1 Core Entity Relationship
 
 ```mermaid
-classDiagram
-    class Project {
-        +str id
-        +str goal
-        +ProjectStatus status
-        +str manager_id
-        +dict staff
-        +dict tasks
-        +StaffingPlan staffing_plan
-        +ProjectResult result
-    }
+graph TD
+    Project[Project]
+    Staff[Staff]
+    Task[Task]
+    Responsibility[Responsibility]
+    Capability[Capability]
+    StaffingPlan[StaffingPlan]
+    StaffRolePlan[StaffRolePlan]
+    ProjectResult[ProjectResult]
 
-    class Staff {
-        +str id
-        +str project_id
-        +str role
-        +str title
-        +StaffStatus status
-        +str current_task_id
-    }
-
-    class Task {
-        +str id
-        +str project_id
-        +str title
-        +str goal
-        +str assigned_to
-        +TaskStatus status
-    }
-
-    class Responsibility {
-        +str name
-        +str description
-    }
-
-    class Capability {
-        +str name
-        +str description
-    }
-
-    class StaffingPlan {
-        +list required_roles
-        +str rationale
-    }
-
-    class StaffRolePlan {
-        +str role
-        +str title
-        +list responsibilities
-        +list capabilities
-        +str task_focus
-        +int priority
-    }
-
-    class ProjectResult {
-        +str summary
-        +str project_understanding
-        +list assumptions
-        +list risks
-        +StaffingPlan staffing_plan
-        +list task_breakdown
-        +list execution_plan
-        +str final_output
-    }
-
-    Project "1" --> "1" Staff : primary manager
-    Project "1" --> "*" Staff : project members
-    Project "1" --> "*" Task : owns
-    Staff "1" --> "*" Responsibility : has
-    Staff "1" --> "*" Capability : has
-    Staff "1" --> "*" Task : assigned
-    ProjectResult "1" --> "1" StaffingPlan : includes
-    StaffingPlan "1" --> "*" StaffRolePlan : requires
+    Project -->|primary manager| Staff
+    Project -->|project members| Staff
+    Project -->|owns| Task
+    Staff -->|has| Responsibility
+    Staff -->|has| Capability
+    Staff -->|assigned| Task
+    ProjectResult -->|includes| StaffingPlan
+    StaffingPlan -->|requires| StaffRolePlan
 ```
 
 ### 4.2 ProjectStatus
@@ -390,13 +338,47 @@ class ProjectRunResult(BaseModel):
 
     result: ProjectResult | None = None
     error: ProjectError | None = None
+    events: list[ProjectEvent] = []
 
     started_at: datetime
     completed_at: datetime | None = None
     duration_ms: int | None = None
 ```
 
-### 4.11 WorkContext
+### 4.11 ProjectEvent and TaskEvent
+
+Events provide lightweight in-memory observability for Version 1.
+
+```python
+class ProjectEvent(BaseModel):
+    id: str
+    project_id: str
+    type: str
+    message: str
+    level: EventLevel
+    actor_id: str | None = None
+    task_id: str | None = None
+    data: dict[str, Any] = {}
+    created_at: datetime
+```
+
+```python
+class TaskEvent(BaseModel):
+    id: str
+    project_id: str
+    task_id: str
+    type: str
+    message: str
+    level: EventLevel
+    actor_id: str | None = None
+    data: dict[str, Any] = {}
+    created_at: datetime
+```
+
+The initial `EventRecorder` appends events to the current `Project` and `Task`.
+It is not persistent storage.
+
+### 4.12 WorkContext
 
 `WorkContext` is the contextual package used by `StaffWorkflow`.
 
@@ -420,9 +402,16 @@ class WorkContext(BaseModel):
     variables: dict[str, Any] = {}
 ```
 
-### 4.12 AssistantRequest and AssistantResponse
+### 4.13 AssistantRequest and AssistantResponse
 
 The assistant interface should use request and response models instead of a narrow `respond(staff, task, context)` signature.
+
+```python
+class OutputContract(BaseModel):
+    name: str
+    json_schema: dict[str, Any]
+    instructions: str
+```
 
 ```python
 class AssistantRequest(BaseModel):
@@ -431,6 +420,7 @@ class AssistantRequest(BaseModel):
     task: Task
     context: WorkContext
     messages: list[Message] = []
+    output_contract: OutputContract | None = None
     output_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = {}
 ```
@@ -443,7 +433,7 @@ class AssistantResponse(BaseModel):
     metadata: dict[str, Any] = {}
 ```
 
-### 4.13 Tools
+### 4.14 Tools
 
 Tools represent callable external actions.
 
@@ -479,7 +469,7 @@ class ToolResult(BaseModel):
 
 Version 1 defines tool interfaces and a noop implementation. It does not execute model-requested tool calls.
 
-### 4.14 Skills
+### 4.15 Skills
 
 Skills represent reusable work methods, domain procedures, or expert workflows.
 
@@ -509,7 +499,7 @@ class SkillSpec(BaseModel):
 
 Version 1 injects selected skill instructions into prompts. It does not implement nested skill runtimes.
 
-### 4.15 Memory
+### 4.16 Memory
 
 Memory is divided by scope:
 
@@ -578,7 +568,7 @@ The framework has these necessary agent modules:
 ### 5.1 Module Dependency Graph
 
 ```mermaid
-flowchart LR
+graph LR
     CLI[CLI] --> Runtime[ProjectRuntime]
     Runtime --> Config[ConfigLoader]
     Runtime --> Registry[Registries]
@@ -659,8 +649,8 @@ The project manager should not use a separate workflow class. It uses the same w
 ### 6.1 StaffWorkflow State Flow
 
 ```mermaid
-stateDiagram-v2
-    [*] --> ReceiveTask
+graph TD
+    Start([Start]) --> ReceiveTask
     ReceiveTask --> BuildContext
     BuildContext --> RetrieveMemory
     RetrieveMemory --> SelectSkills
@@ -670,16 +660,16 @@ stateDiagram-v2
     ExecuteWork --> ParseOutput
     ParseOutput --> UpdateMemory
     UpdateMemory --> ReportResult
-    ReportResult --> [*]
+    ReportResult --> End([End])
 
-    ExecuteWork --> ReportResult: execution error
-    ParseOutput --> ReportResult: parse fallback or failure
+    ExecuteWork -->|execution error| ReportResult
+    ParseOutput -->|parse fallback or failure| ReportResult
 ```
 
 ### 6.2 Workflow Collaboration
 
 ```mermaid
-flowchart TD
+graph TD
     Task[Task] --> Receive[receive_task]
     Staff[Staff] --> Receive
     Project[Project] --> Build[build_context]
@@ -857,6 +847,9 @@ lego-agent project run --config configs/project_runtime.json --json "Build a con
 
 The old organization CLI and configuration should be removed during the rewrite.
 
+For the detailed runtime call chain from CLI entry to `ProjectRunResult`, see
+[CLI Call Flow](CLI_CALL_FLOW.md).
+
 ## 11. Orchestration
 
 Version 1 supports exactly one orchestration strategy:
@@ -875,10 +868,159 @@ The orchestrator must:
 6. complete or fail the project
 7. return `ProjectRunResult`
 
-### 11.1 Project Manager Only Orchestration
+## 11.1 Staff Interaction Model
+
+Version 2 should not make staff call each other directly. Staff interaction
+should happen through project state, events, messages, and orchestration.
+
+Core rule:
+
+```text
+Staff do not directly invoke other Staff.
+Staff create/update Tasks, publish Events, and send Messages.
+The Orchestrator decides what runs next.
+```
+
+### 11.1.1 Interaction Layers
+
+```text
+Task State: the source of truth
+Event Log: what happened
+Inbox Message: who should be notified
+```
+
+Example:
+
+```text
+Staff completes task
+  -> Task.status = done
+  -> Task.result = ...
+  -> publish task_completed event
+  -> send task_completed message to manager inbox
+```
+
+Manager awareness should come from:
+
+1. `TaskStore` queries for reliable state.
+2. `StaffMessage` inbox entries for notifications.
+3. Project/task events for audit and debugging.
+4. Staff status as supporting information.
+
+### 11.1.2 Proposed Models
+
+```python
+class StaffMessage(BaseModel):
+    id: str
+    project_id: str
+    sender_id: str
+    recipient_id: str
+    type: str
+    task_id: str | None = None
+    content: str
+    data: dict[str, Any] = {}
+    created_at: datetime
+    read_at: datetime | None = None
+```
+
+```python
+class StaffInbox(BaseModel):
+    staff_id: str
+    project_id: str
+    messages: list[StaffMessage] = []
+```
+
+### 11.1.3 Proposed Interfaces
+
+```python
+class TaskStore(Protocol):
+    def create(self, task: Task) -> Task: ...
+    def update(self, task: Task) -> Task: ...
+    def get(self, task_id: str) -> Task: ...
+    def children_of(self, parent_task_id: str) -> list[Task]: ...
+```
+
+```python
+class MessageBus(Protocol):
+    def send(self, message: StaffMessage) -> None: ...
+    def unread_for(self, staff_id: str, project_id: str) -> list[StaffMessage]: ...
+    def mark_read(self, message_id: str) -> None: ...
+```
+
+```python
+class TaskDispatcher:
+    def assign(
+        self,
+        project: Project,
+        task: Task,
+        assignee: Staff,
+        created_by: Staff,
+    ) -> None:
+        ...
+```
+
+```python
+class TaskCompletionHandler:
+    def complete(
+        self,
+        project: Project,
+        task: Task,
+        staff: Staff,
+        result: WorkResult,
+    ) -> None:
+        ...
+```
+
+### 11.1.4 Manager Notification Flow
 
 ```mermaid
-flowchart TD
+sequenceDiagram
+    participant M as Manager Staff
+    participant O as Orchestrator
+    participant TS as TaskStore
+    participant S as Worker Staff
+    participant EB as EventBus
+    participant MB as MessageBus
+
+    M->>O: staffing/task plan
+    O->>TS: create child tasks
+    O->>EB: publish task_assigned
+    S->>TS: claim assigned task
+    S->>TS: update status=in_progress
+    S->>EB: publish task_started
+    S->>TS: update status=done, result=...
+    S->>EB: publish task_completed
+    EB->>MB: send task_completed message to manager
+    O->>TS: check child task statuses
+    O->>M: wake for review/synthesis
+```
+
+### 11.1.5 Implementation Strategy
+
+Do not start with distributed async execution.
+
+Version 2 should progress in three steps:
+
+1. Synchronous multi-staff with event/message semantics.
+   - Create recruited staff.
+   - Create child tasks.
+   - Execute staff tasks one by one.
+   - Emit events and manager messages.
+   - Manager reviews after all child tasks complete.
+
+2. `asyncio` concurrent staff tasks.
+   - Use the same stores and buses.
+   - Replace sequential execution with concurrent task execution.
+
+3. Distributed execution.
+   - Replace in-memory stores/buses with Redis, database-backed queues, or workers.
+
+The source of truth remains task state. Events and messages are notifications,
+not the final authority.
+
+### 11.2 Project Manager Only Orchestration
+
+```mermaid
+graph TD
     Goal[Project Goal] --> CreateProject[Create Project]
     CreateProject --> CreatePM[Create Project Manager Staff]
     CreatePM --> CreateTask[Create Manager Task]
@@ -891,10 +1033,10 @@ flowchart TD
     Failed --> RunResult
 ```
 
-### 11.2 Version Evolution
+### 11.3 Version Evolution
 
 ```mermaid
-flowchart LR
+graph LR
     V1[V1 project_manager_only] --> V2[V2 project_manager_with_staff]
     V2 --> V3[V3 persistent memory and tool execution]
 

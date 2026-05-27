@@ -1,7 +1,7 @@
 [project]
 name = "lego-agent"
 version = "0.1.0"
-description = "Configurable staff-oriented agent framework."
+description = "Project-oriented agent framework."
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=0.2.0",

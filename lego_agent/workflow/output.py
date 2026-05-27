@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from pydantic import ValidationError
 
 from lego_agent.core.models import Project, ProjectResult, StaffRolePlan, StaffingPlan
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectResultOutputParser:
@@ -17,11 +20,28 @@ class ProjectResultOutputParser:
     def parse(self, content: str, project: Project) -> ProjectResult:
         try:
             raw = json.loads(content)
-            return ProjectResult.model_validate(raw)
-        except (json.JSONDecodeError, ValidationError, TypeError, ValueError):
+            parsed = ProjectResult.model_validate(raw)
+            logger.debug(
+                "assistant output parsed as ProjectResult",
+                extra={"project_id": project.id, "content_length": len(content)},
+            )
+            return parsed
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+            logger.warning(
+                "assistant output required ProjectResult fallback",
+                extra={
+                    "project_id": project.id,
+                    "content_length": len(content),
+                    "error_type": exc.__class__.__name__,
+                },
+            )
             return self.fallback(content, project)
 
     def fallback(self, content: str, project: Project) -> ProjectResult:
+        logger.debug(
+            "building ProjectResult fallback",
+            extra={"project_id": project.id, "content_length": len(content)},
+        )
         staffing_plan = StaffingPlan(
             required_roles=[
                 StaffRolePlan(

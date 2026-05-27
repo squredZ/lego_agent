@@ -27,7 +27,7 @@ Verified commands:
 Current test result:
 
 ```text
-10 passed
+19 passed
 ```
 
 ## Version 1 Scope
@@ -60,6 +60,47 @@ Excluded:
 - Real multi-round tool calling
 - Skill runtime execution
 - Long-term memory retrieval
+
+## Engineering Rules
+
+Every development task must follow these rules:
+
+1. Comments and docstrings must be clear for beginners.
+   - Explain why a class or function exists.
+   - Explain non-obvious design choices.
+   - Avoid noisy comments that merely restate a line of code.
+
+2. Code must follow SOLID principles.
+   - Single Responsibility: each class or function should have one clear reason to change.
+   - Open/Closed: extension points should prefer registries, composition, or new classes over modifying stable code paths.
+   - Liskov Substitution: implementations of common protocols should be replaceable without surprising callers.
+   - Interface Segregation: avoid forcing components to depend on methods they do not use.
+   - Dependency Inversion: high-level runtime and workflow code should depend on abstractions or injected collaborators where practical.
+
+3. Code should act as documentation.
+   - Prefer clear names, explicit types, small functions, and obvious module boundaries.
+   - Let Pydantic models, Protocols, and tests describe contracts and examples.
+   - Use comments to explain why a design exists, not to repeat what a line does.
+   - Tests should read like executable examples of framework usage.
+
+4. Runtime behavior must be observable through clear logs and events.
+   - Important lifecycle transitions should produce structured events or logs.
+   - Logs should explain what happened, which project/task/staff was involved, and why a failure occurred.
+   - Avoid logging secrets such as API keys, tokens, and raw credentials.
+   - Prefer stable event names and structured metadata over long free-form messages.
+   - Tests should cover important logging or event behavior when it is part of the contract.
+
+5. After every completed task, perform a short review.
+   - Are comments and docstrings enough for a beginner to understand intent?
+   - Does the code explain itself through names, types, structure, and tests?
+   - Does the implementation keep responsibilities separated?
+   - Are dependencies injected or isolated where future replacement is likely?
+   - Did the change avoid unnecessary coupling between runtime, workflow, assistant, tools, skills, memory, and output parsing?
+   - Are logs and events sufficient to understand normal flow and failures?
+   - Did the change avoid logging secrets or noisy implementation details?
+   - Are tests updated for the behavior or extension point that changed?
+
+This review is part of the task definition, not optional cleanup.
 
 ## Completed Work
 
@@ -280,6 +321,12 @@ Also supported:
 lego-agent project run --config configs/project_runtime.json --json "project goal"
 ```
 
+Runtime logs can be enabled from the CLI:
+
+```bash
+lego-agent --log-level INFO project run --config configs/project_runtime.json "project goal"
+```
+
 Human output includes:
 
 - project id
@@ -327,13 +374,55 @@ Implemented:
 - `docs/DEVELOPMENT_PLAN.md` refreshed with current progress.
 - Beginner-oriented docstrings and comments added to key modules.
 
+### Phase 9: Tighten Version 1 Runtime Quality
+
+Status: complete for current Version 1 scope.
+
+Completed:
+
+1. Added event models:
+   - `EventLevel`
+   - `ProjectEvent`
+   - `TaskEvent`
+2. Added `EventRecorder`.
+3. Added in-memory project/task event recording for:
+   - project created
+   - manager created
+   - task created
+   - project planning started
+   - workflow started
+   - workflow hooks
+   - workflow completed
+   - workflow failed
+   - task failed
+   - project completed
+   - project failed
+4. Added `events` to `ProjectRunResult`.
+5. Improved CLI error display for config/runtime creation failures.
+6. Added tests for:
+   - successful event recording
+   - failed workflow event recording
+   - CLI config error handling
+
+Decisions:
+
+1. Human CLI output hides events by default.
+2. Human CLI output supports `--events`.
+3. JSON output includes `ProjectRunResult.events` by default.
+4. LangGraph remains a dependency for future multi-staff orchestration, but it is not used in the single-node PM-only runtime.
+
+Remaining:
+
+1. Consider a persistent event store after the runtime model stabilizes.
+2. Reevaluate LangGraph when Version 2 multi-staff orchestration starts.
+
 ## Known Gaps
 
 These are intentionally not blocking Version 1, but should be addressed soon.
 
 1. LangGraph is no longer used by the new project runtime.
    - It remains a dependency.
-   - Decision needed: reintroduce LangGraph in project orchestration or remove the dependency until multi-node orchestration starts.
+   - Decision: keep the dependency for now, but do not use it in single-node PM-only runtime. Reevaluate when Version 2 multi-staff orchestration starts.
 
 2. Real model structured output is prompt-based.
    - Dry-run returns valid structured data.
@@ -343,9 +432,9 @@ These are intentionally not blocking Version 1, but should be addressed soon.
 3. Workflow/orchestrator/tool/skill/output parser registries are deferred.
    - Current code has stable classes but not full registries for every extension point.
 
-4. No project event log yet.
-   - Workflow state changes happen in memory.
-   - A `ProjectEvent` model and event recorder would improve observability.
+4. Event recording is in-memory only.
+   - Project and task events are available in the current run result.
+   - Persistent event storage is still deferred.
 
 5. No persistent storage.
    - Projects and tasks exist only for a single run.
@@ -355,44 +444,20 @@ These are intentionally not blocking Version 1, but should be addressed soon.
 
 ## Next Development Plan
 
-### Phase 9: Tighten Version 1 Runtime Quality
-
-Objective: make the current project-manager-only runtime more robust before adding dynamic staff.
-
-Tasks:
-
-1. Add `ProjectEvent` and `TaskEvent` models.
-2. Add `EventRecorder`.
-3. Record major runtime events:
-   - project created
-   - manager created
-   - task created
-   - workflow hook started/completed
-   - project completed/failed
-4. Improve CLI error display.
-5. Add tests for failed assistant/workflow paths.
-6. Decide LangGraph dependency direction:
-   - reintroduce LangGraph for `project_manager_only`
-   - or remove it until Version 2 orchestration
-
-Acceptance:
-
-- Failed runs produce useful `ProjectRunResult.error`.
-- Runtime events can be inspected in tests.
-- Dependency direction is documented.
-
 ### Phase 10: Improve Structured Output Contract
+
+Status: complete for current Version 1 scope.
 
 Objective: make live assistant output more reliable.
 
 Tasks:
 
-1. Add a reusable `OutputContract` model.
-2. Pass `ProjectResult` JSON schema into `AssistantRequest.output_schema`.
-3. Update `DefaultPromptBuilder` to include explicit schema instructions.
-4. Investigate OpenAI Responses API structured output support for current SDK.
-5. Keep fallback parsing.
-6. Add tests for valid JSON, invalid JSON, and partial JSON.
+1. Add a reusable `OutputContract` model: done.
+2. Pass `ProjectResult` JSON schema into `AssistantRequest.output_schema`: done.
+3. Update `DefaultPromptBuilder` to include explicit schema instructions: done.
+4. Keep fallback parsing: done.
+5. Add tests for valid JSON, invalid JSON, and partial JSON: done.
+6. Investigate OpenAI Responses API structured output support for current SDK: deferred until live provider integration hardening.
 
 Acceptance:
 
@@ -431,7 +496,85 @@ Planned orchestration strategy:
 project_manager_with_staff
 ```
 
+Design rule:
+
+```text
+Staff do not directly call other Staff.
+They coordinate through Task state, Events, Messages, and the Orchestrator.
+```
+
+### Version 2A: Synchronous Multi-Staff Semantics
+
+Objective: model multi-staff collaboration without real concurrency.
+
 Tasks:
+
+1. Add interaction models:
+   - `StaffMessage`
+   - `StaffInbox`
+2. Add state/communication interfaces:
+   - `TaskStore`
+   - `MessageBus`
+   - optional `EventBus`
+3. Add in-memory implementations:
+   - `InMemoryTaskStore`
+   - `InMemoryMessageBus`
+4. Add coordination helpers:
+   - `TaskDispatcher`
+   - `TaskCompletionHandler`
+5. Runtime maps `StaffRolePlan` to `StaffProfileConfig`.
+6. Runtime creates recruited staff inside the project.
+7. Runtime creates child tasks assigned to recruited staff.
+8. Staff execute child tasks one by one through `SinglePassStaffWorkflow`.
+9. Child task completion updates task state, emits task events, and sends manager inbox messages.
+10. Manager reviews after all child tasks complete.
+
+Acceptance:
+
+- A project can create at least two recruited staff from profiles.
+- Recruited staff receive child tasks.
+- Each child task completion creates:
+  - updated task state
+  - task event
+  - manager inbox message
+- Manager final review uses task state as source of truth.
+- Existing PM-only mode remains supported.
+
+### Version 2B: Asyncio Concurrent Staff Execution
+
+Objective: make staff task execution concurrent while keeping the same state/message abstractions.
+
+Tasks:
+
+1. Add async orchestration path using `asyncio`.
+2. Run child staff workflows concurrently.
+3. Keep `TaskStore` as source of truth.
+4. Use events/messages for notification.
+5. Add timeout and failure handling.
+
+Acceptance:
+
+- Multiple staff tasks can run concurrently.
+- Failed child tasks are visible to manager and project state.
+- Manager review waits for completion criteria rather than direct staff calls.
+
+### Version 2C: Distributed Execution Readiness
+
+Objective: prepare the same interaction model for external workers.
+
+Tasks:
+
+1. Define store/bus contracts that can be backed by SQLite/Postgres/Redis.
+2. Add serialization tests for tasks, events, and messages.
+3. Define retry and idempotency expectations.
+4. Keep project orchestration independent of storage implementation.
+
+Acceptance:
+
+- In-memory implementation can be replaced without changing workflow logic.
+- Task/event/message models are safe to persist.
+
+### Original Version 2 Capabilities
 
 1. Project manager creates a structured `StaffingPlan`.
 2. Runtime maps `StaffRolePlan` to `StaffProfileConfig`.
@@ -441,12 +584,12 @@ Tasks:
 6. Project manager reviews staff outputs.
 7. Project manager produces final `ProjectResult`.
 
-Acceptance:
+Manager awareness must come from:
 
-- A project can create at least two recruited staff from profiles.
-- Recruited staff execute assigned tasks.
-- PM receives staff outputs and produces final output.
-- Existing PM-only mode remains supported.
+1. `TaskStore` state queries.
+2. Manager inbox messages.
+3. Project/task events.
+4. Staff status only as supporting information.
 
 ## Version 3 Preview
 

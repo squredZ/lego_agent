@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import logging
+
 from lego_agent.assistants.openai_assistant import OpenAIAssistant
 from lego_agent.cli import main
-from lego_agent.core.models import Project, ProjectStatus, Staff, Task, TaskStatus
+from lego_agent.core.models import (
+    AssistantRequest,
+    Project,
+    ProjectStatus,
+    Staff,
+    Task,
+    TaskStatus,
+    WorkContext,
+)
 from lego_agent.project.config import parse_project_runtime_config
 from lego_agent.project.runtime import create_project_runtime
 from lego_agent.workflow.managers import NoopMemoryManager, NoopSkillManager, NoopToolManager
+from lego_agent.workflow.output import ProjectResultOutputParser
 from lego_agent.workflow.staff_workflow import SinglePassStaffWorkflow
 
 
@@ -29,6 +40,22 @@ def _config() -> dict[str, object]:
             }
         },
     }
+
+
+def _assistant_request(project: Project, staff: Staff) -> AssistantRequest:
+    task = Task(project_id=project.id, title="Plan", goal="Plan")
+    context = WorkContext(
+        project_id=project.id,
+        task_id=task.id,
+        staff_id=staff.id,
+        project_goal=project.goal,
+        task_goal=task.goal,
+    )
+    return AssistantRequest(project=project, staff=staff, task=task, context=context)
+
+
+def _manager_task(project: Project) -> Task:
+    return next(iter(project.tasks.values()))
 
 
 def test_project_model_requires_project_manager_role() -> None:
@@ -68,6 +95,35 @@ def test_project_manager_only_dry_run_returns_project_result() -> None:
     assert "Build a project-oriented agent framework" in result.result.project_understanding
 
 
+def test_project_run_records_events() -> None:
+    runtime = create_project_runtime(parse_project_runtime_config(_config()))
+
+    result = runtime.run("Build a project-oriented agent framework")
+
+    event_types = [event.type for event in result.events]
+    assert "project_created" in event_types
+    assert "manager_created" in event_types
+    assert "task_created" in event_types
+    assert "workflow_started" in event_types
+    assert "project_completed" in event_types
+    assert any(event.type == "workflow_hook" for event in result.events)
+
+
+def test_project_run_emits_useful_logs(caplog) -> None:
+    caplog.set_level(logging.DEBUG)
+    runtime = create_project_runtime(parse_project_runtime_config(_config()))
+
+    result = runtime.run("Build a project-oriented agent framework")
+
+    assert result.status == ProjectStatus.DONE
+    messages = [record.getMessage() for record in caplog.records]
+    assert "project run started" in messages
+    assert "staff workflow started" in messages
+    assert "assistant using dry-run response" in messages
+    assert "project manager orchestration completed" in messages
+    assert all("test-key" not in record.getMessage() for record in caplog.records)
+
+
 def test_workflow_exposes_expected_hook_order() -> None:
     workflow = SinglePassStaffWorkflow()
     runtime = create_project_runtime(parse_project_runtime_config(_config()))
@@ -91,6 +147,48 @@ def test_workflow_exposes_expected_hook_order() -> None:
     ]
 
 
+def test_workflow_adds_project_result_output_contract() -> None:
+    captured = {}
+
+    class CapturingAssistant:
+        """Test fake that records the request before delegating to dry-run output."""
+
+        def respond(self, request):
+            captured["request"] = request
+            return OpenAIAssistant(model="test-model", dry_run=True).respond(request)
+
+    runtime = create_project_runtime(parse_project_runtime_config(_config()))
+    project = runtime.create_project("Plan the project")
+    project.manager.assistant = CapturingAssistant()
+    task = _manager_task(project)
+
+    result = runtime.workflow.run(project, project.manager, task)
+    request = captured["request"]
+
+    assert result.status == TaskStatus.DONE
+    assert request.output_contract.name == "ProjectResult"
+    assert request.output_schema["title"] == "ProjectResult"
+    assert "ProjectResult" in request.messages[-1].content
+    assert "Return only valid JSON" in request.messages[-1].content
+
+
+def test_failed_workflow_records_error_events() -> None:
+    runtime = create_project_runtime(parse_project_runtime_config(_config()))
+    project = runtime.create_project("Plan the project")
+    project.manager.assistant = None
+
+    result = runtime.orchestrator.run(project)
+    task = _manager_task(project)
+
+    assert result.status == ProjectStatus.FAILED
+    assert result.error is not None
+    assert result.error.type == "ValueError"
+    assert task.status == TaskStatus.FAILED
+    assert any(event.type == "workflow_failed" for event in result.events)
+    assert any(event.type == "project_failed" for event in result.events)
+    assert any(event.type == "task_failed" for event in task.events)
+
+
 def test_noop_managers_are_safe() -> None:
     staff = Staff(
         id="pm",
@@ -109,6 +207,57 @@ def test_noop_managers_are_safe() -> None:
         task,
         "Plan",
     ) == []
+
+
+def test_project_result_parser_accepts_valid_json() -> None:
+    staff = Staff(
+        id="pm",
+        project_id="project",
+        name="Ava",
+        role="project_manager",
+        title="Project Manager",
+    )
+    project = Project(goal="Plan", manager_id="pm", staff={"pm": staff})
+    content = OpenAIAssistant(model="test-model", dry_run=True).respond(
+        _assistant_request(project, staff)
+    ).content
+
+    parsed = ProjectResultOutputParser().parse(content, project)
+
+    assert parsed.summary == "Ava prepared an initial project plan."
+
+
+def test_project_result_parser_falls_back_on_invalid_json() -> None:
+    staff = Staff(
+        id="pm",
+        project_id="project",
+        name="Ava",
+        role="project_manager",
+        title="Project Manager",
+    )
+    project = Project(goal="Plan", manager_id="pm", staff={"pm": staff})
+
+    parsed = ProjectResultOutputParser().parse("not json", project)
+
+    assert parsed.project_understanding == "Plan"
+    assert parsed.final_output == "not json"
+    assert parsed.risks == ["Assistant output required fallback parsing."]
+
+
+def test_project_result_parser_falls_back_on_partial_json() -> None:
+    staff = Staff(
+        id="pm",
+        project_id="project",
+        name="Ava",
+        role="project_manager",
+        title="Project Manager",
+    )
+    project = Project(goal="Plan", manager_id="pm", staff={"pm": staff})
+
+    parsed = ProjectResultOutputParser().parse('{"summary": "partial"}', project)
+
+    assert parsed.summary == "Project manager produced an unstructured response."
+    assert parsed.final_output == '{"summary": "partial"}'
 
 
 def test_assistant_config_matches_openai_runtime_options() -> None:
@@ -188,3 +337,54 @@ def test_cli_project_run_json(capsys) -> None:
     assert exit_code == 0
     assert '"status": "done"' in output
     assert '"manager_id": "project_manager"' in output
+
+
+def test_cli_human_output_hides_events_by_default(capsys) -> None:
+    exit_code = main(
+        [
+            "project",
+            "run",
+            "--config",
+            "configs/project_runtime.json",
+            "Build a project-oriented agent framework",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "events:" not in output
+
+
+def test_cli_human_output_can_show_events(capsys) -> None:
+    exit_code = main(
+        [
+            "project",
+            "run",
+            "--config",
+            "configs/project_runtime.json",
+            "--events",
+            "Build a project-oriented agent framework",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "events:" in output
+    assert "project_created" in output
+    assert "workflow_started" in output
+
+
+def test_cli_reports_config_errors(capsys) -> None:
+    exit_code = main(
+        [
+            "project",
+            "run",
+            "--config",
+            "configs/missing.json",
+            "Build a project-oriented agent framework",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "error:" in captured.err

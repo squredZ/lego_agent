@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from lego_agent.core.models import (
     MemoryItem,
     Project,
@@ -12,6 +14,8 @@ from lego_agent.core.models import (
     WorkContext,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class DefaultContextManager:
     """Builds the minimal context needed by Version 1.
@@ -21,6 +25,10 @@ class DefaultContextManager:
     """
 
     def build_context(self, project: Project, staff: Staff, task: Task) -> WorkContext:
+        logger.debug(
+            "building work context",
+            extra={"project_id": project.id, "staff_id": staff.id, "task_id": task.id},
+        )
         responsibilities = ", ".join(item.name for item in staff.responsibilities)
         capabilities = ", ".join(item.name for item in staff.capabilities)
         return WorkContext(
@@ -52,9 +60,27 @@ class NoopMemoryManager:
         task: Task,
         query: str,
     ) -> list[MemoryItem]:
+        logger.debug(
+            "noop memory retrieve",
+            extra={
+                "project_id": project.id,
+                "staff_id": staff.id,
+                "task_id": task.id,
+                "query_length": len(query),
+            },
+        )
         return []
 
     def remember(self, project: Project, staff: Staff, item: MemoryItem) -> None:
+        logger.debug(
+            "noop memory remember",
+            extra={
+                "project_id": project.id,
+                "staff_id": staff.id,
+                "scope": item.scope,
+                "tag_count": len(item.tags),
+            },
+        )
         return None
 
 
@@ -66,9 +92,14 @@ class NoopToolManager:
     """
 
     def list_tools(self, staff: Staff, task: Task) -> list[ToolSpec]:
+        logger.debug(
+            "noop tool list",
+            extra={"project_id": task.project_id, "staff_id": staff.id, "task_id": task.id},
+        )
         return []
 
     def call_tool(self, call: ToolCall) -> ToolResult:
+        logger.warning("tool call rejected because tools are disabled", extra={"tool_name": call.tool_name})
         return ToolResult(
             tool_name=call.tool_name,
             success=False,
@@ -84,6 +115,10 @@ class NoopSkillManager:
     """
 
     def list_skills(self, staff: Staff, task: Task) -> list[SkillSpec]:
+        logger.debug(
+            "noop skill list",
+            extra={"project_id": task.project_id, "staff_id": staff.id, "task_id": task.id},
+        )
         return []
 
     def select_skills(
@@ -92,4 +127,12 @@ class NoopSkillManager:
         task: Task,
         context: WorkContext,
     ) -> list[SkillSpec]:
+        logger.debug(
+            "noop skill select",
+            extra={
+                "project_id": context.project_id,
+                "staff_id": staff.id,
+                "task_id": task.id,
+            },
+        )
         return []

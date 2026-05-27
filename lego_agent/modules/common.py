@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import logging
+
 from lego_agent.core.models import Capability, Responsibility
 from lego_agent.core.registry import Registry
+
+logger = logging.getLogger(__name__)
 
 responsibilities = Registry[Responsibility]("responsibilities")
 capabilities = Registry[Capability]("capabilities")
 
 
 def register_defaults() -> None:
+    """Register built-in project responsibilities and capabilities.
+
+    The checks make this function idempotent, so tests and repeated runtime
+    construction can call it safely.
+    """
     defaults = [
         Responsibility(
             name="requirements_analysis",
@@ -45,6 +54,7 @@ def register_defaults() -> None:
     for item in defaults:
         if responsibilities.maybe_get(item.name) is None:
             responsibilities.register(item.name, item)
+            logger.debug("registered default responsibility", extra={"responsibility": item.name})
 
     capability_defaults = [
         Capability(
@@ -66,3 +76,4 @@ def register_defaults() -> None:
     for item in capability_defaults:
         if capabilities.maybe_get(item.name) is None:
             capabilities.register(item.name, item)
+            logger.debug("registered default capability", extra={"capability": item.name})
