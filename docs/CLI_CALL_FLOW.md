@@ -69,7 +69,7 @@ The CLI parses:
 - command: `project run`
 - config path: `configs/project_runtime.json`
 - project goal: the final positional argument
-- output options: `--json`, `--events`
+- output options: `--json`, `--events`, `--staffing-matches`
 - logging option: `--log-level`, or `LEGO_AGENT_LOG_LEVEL`
 
 ### 2. Config Loading
@@ -93,6 +93,10 @@ The important config sections are:
 - staff profiles
 - assistant settings
 - optional module imports
+
+The configured staff profiles are also used after project-manager planning to
+resolve `StaffRolePlan.role` values into concrete profile names. This is a
+Version 1 preparation step for later dynamic staff creation.
 
 ### 3. Runtime Creation
 
@@ -339,7 +343,8 @@ OpenAIAssistant
 
 If no API key is available, the assistant uses dry-run mode and returns deterministic structured output.
 
-If an API key is available and dry-run is disabled, the assistant calls the OpenAI-compatible Responses API.
+If an API key is available and dry-run is disabled, the assistant calls the
+OpenAI-compatible Chat Completions API.
 
 ### 15. parse_output
 

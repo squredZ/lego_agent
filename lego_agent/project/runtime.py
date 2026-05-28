@@ -21,6 +21,7 @@ from lego_agent.modules.common import capabilities, register_defaults, responsib
 from lego_agent.project.config import AssistantConfig, ProjectRuntimeConfig, StaffProfileConfig
 from lego_agent.project.events import EventRecorder
 from lego_agent.project.orchestrator import ProjectManagerOnlyOrchestrator
+from lego_agent.project.staffing import StaffProfileResolver
 from lego_agent.workflow.staff_workflow import SinglePassStaffWorkflow
 
 AssistantFactory = Callable[[dict[str, object]], Assistant]
@@ -84,6 +85,7 @@ class ProjectRuntime:
         try:
             project = self.create_project(goal)
             result = self.orchestrator.run(project)
+            self._attach_staff_profile_resolution(result)
             result.started_at = started_at
             result.completed_at = result.completed_at or utc_now()
             result.duration_ms = _duration_ms(started_at, result.completed_at)
@@ -214,6 +216,22 @@ class ProjectRuntime:
             raise ValueError(f"unsupported orchestration strategy: {strategy}")
         logger.debug("created orchestrator", extra={"strategy": strategy})
         return ProjectManagerOnlyOrchestrator(self.workflow, self.event_recorder)
+
+    def _attach_staff_profile_resolution(self, result: ProjectRunResult) -> None:
+        """Attach staffing profile matches after the PM produces a plan."""
+        if result.result is None:
+            logger.debug("skipping staff profile resolution because project result is empty")
+            return
+        resolver = StaffProfileResolver(self.config.staff_profiles)
+        result.staffing_profile_resolution = resolver.resolve(result.result.staffing_plan)
+        logger.info(
+            "staffing profile resolution attached to run result",
+            extra={
+                "project_id": result.project_id,
+                "match_count": len(result.staffing_profile_resolution.matches),
+                "unresolved_count": len(result.staffing_profile_resolution.unresolved),
+            },
+        )
 
 
 def _create_assistant(config: AssistantConfig) -> Assistant:

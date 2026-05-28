@@ -457,7 +457,8 @@ Tasks:
 3. Update `DefaultPromptBuilder` to include explicit schema instructions: done.
 4. Keep fallback parsing: done.
 5. Add tests for valid JSON, invalid JSON, and partial JSON: done.
-6. Investigate OpenAI Responses API structured output support for current SDK: deferred until live provider integration hardening.
+6. Use Chat Completions for OpenAI-compatible providers: done.
+7. Investigate provider-native structured output support later: deferred until live provider integration hardening.
 
 Acceptance:
 
@@ -466,6 +467,8 @@ Acceptance:
 - Dry-run remains deterministic.
 
 ### Phase 11: Staff Profile Expansion
+
+Status: complete for current Version 1 scope.
 
 Objective: prepare for dynamic staffing without executing recruited staff yet.
 
@@ -476,15 +479,17 @@ Tasks:
    - review staff
    - testing staff
    - research staff
-2. Add `StaffProfileResolver`.
-3. Match `StaffRolePlan.role` to configured profiles.
-4. Return unresolved roles clearly.
-5. Add CLI option to print planned staff profile matches.
+   Status: done.
+2. Add `StaffProfileResolver`: done.
+3. Match `StaffRolePlan.role` to configured profiles: done.
+4. Return unresolved roles clearly: done.
+5. Add CLI option to print planned staff profile matches: done.
 
 Acceptance:
 
 - PM staffing plan can be matched against configured profiles.
 - Missing profile cases are tested.
+- Human CLI output can show planned role/profile matches with `--staffing-matches`.
 
 ## Version 2 Plan: Dynamic Staff Creation and Execution
 

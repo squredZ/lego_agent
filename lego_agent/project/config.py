@@ -27,6 +27,8 @@ class AssistantConfig(BaseModel):
     timeout_seconds: float | None = None
     thinking: dict[str, Any] | None = None
     reasoning_effort: str | None = None
+    response_format: dict[str, Any] | None = None
+    stream: bool = False
     token_limit: int | None = Field(
         default=None,
         validation_alias=AliasChoices("token_limit", "tokenlimit", "max_output_tokens"),
@@ -56,6 +58,8 @@ class AssistantConfig(BaseModel):
             "timeout_seconds": self.timeout_seconds,
             "thinking": self.thinking,
             "reasoning_effort": self.reasoning_effort,
+            "response_format": self.response_format,
+            "stream": self.stream,
             "token_limit": self.token_limit,
             "dry_run": self.dry_run,
             **extra,

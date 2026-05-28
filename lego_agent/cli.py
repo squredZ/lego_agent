@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include project events in human-readable output.",
     )
+    run_parser.add_argument(
+        "--staffing-matches",
+        action="store_true",
+        help="Include planned role to staff profile matches in human-readable output.",
+    )
     return parser
 
 
@@ -65,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
                     "config_path": args.config,
                     "json_output": args.json,
                     "include_events": args.events,
+                    "include_staffing_matches": args.staffing_matches,
                     "goal_length": len(args.goal),
                 },
             )
@@ -78,7 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(run_result.model_dump_json(indent=2))
         else:
-            _print_human_result(run_result, include_events=args.events)
+            _print_human_result(
+                run_result,
+                include_events=args.events,
+                include_staffing_matches=args.staffing_matches,
+            )
         logger.info(
             "cli project run completed",
             extra={"project_id": run_result.project_id, "status": run_result.status.value},
@@ -105,6 +115,7 @@ def _print_human_result(
     run_result: ProjectRunResult,
     *,
     include_events: bool = False,
+    include_staffing_matches: bool = False,
 ) -> None:
     """Print compact CLI output for people.
 
@@ -125,6 +136,18 @@ def _print_human_result(
         print(run_result.result.final_output)
     elif run_result.error:
         print(f"error: {run_result.error.message}")
+
+    if include_staffing_matches and run_result.staffing_profile_resolution is not None:
+        print()
+        print("staffing profile matches:")
+        for match in run_result.staffing_profile_resolution.matches:
+            if match.matched:
+                print(
+                    f"- {match.planned_title} ({match.planned_role}) -> "
+                    f"{match.profile_title} ({match.profile_name})"
+                )
+            else:
+                print(f"- {match.planned_title} ({match.planned_role}) -> unresolved: {match.reason}")
 
     if include_events:
         print()

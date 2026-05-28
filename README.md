@@ -38,6 +38,13 @@ Human-readable output keeps events hidden unless requested:
 lego-agent project run --events --config configs/project_runtime.json "Build a configurable agent framework"
 ```
 
+The runtime also resolves the project manager's planned roles against configured
+staff profiles. Show those matches in human-readable output with:
+
+```bash
+lego-agent project run --staffing-matches --config configs/project_runtime.json "Build a configurable agent framework"
+```
+
 CLI logging uses Python's standard `logging` module. It is quiet by default;
 enable runtime logs when debugging:
 

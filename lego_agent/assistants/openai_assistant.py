@@ -31,6 +31,8 @@ class OpenAIAssistant:
     timeout_seconds: float | None = None
     thinking: dict[str, Any] | None = None
     reasoning_effort: str | None = None
+    response_format: dict[str, Any] | None = None
+    stream: bool = False
     token_limit: int | None = None
     dry_run: bool | None = None
 
@@ -63,6 +65,7 @@ class OpenAIAssistant:
                 "has_api_key": bool(api_key),
                 "has_base_url": bool(base_url),
                 "timeout_seconds": self.timeout_seconds,
+                "stream": self.stream,
             },
         )
         if api_key:
@@ -73,7 +76,12 @@ class OpenAIAssistant:
             client_kwargs["timeout"] = self.timeout_seconds
 
         client = OpenAI(**client_kwargs)
-        response = client.responses.create(**self._response_kwargs(request))
+        response = client.chat.completions.create(**self._chat_completion_kwargs(request))
+        content = (
+            self._streaming_chat_completion_content(response)
+            if self.stream
+            else self._chat_completion_content(response)
+        )
         logger.info(
             "assistant received OpenAI-compatible response",
             extra={
@@ -81,43 +89,115 @@ class OpenAIAssistant:
                 "staff_id": request.staff.id,
                 "task_id": request.task.id,
                 "model": self.model,
-                "content_length": len(response.output_text),
+                "content_length": len(content),
             },
         )
-        return AssistantResponse(content=response.output_text, raw=response)
+        return AssistantResponse(content=content, raw=response)
 
-    def _response_kwargs(self, request: AssistantRequest) -> dict[str, Any]:
-        """Map framework request fields to OpenAI Responses API parameters."""
+    def _chat_completion_kwargs(self, request: AssistantRequest) -> dict[str, Any]:
+        """Map framework request fields to Chat Completions parameters."""
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "input": [
-                {
-                    "role": "system",
-                    "content": self._system_prompt(request),
-                },
-                {
-                    "role": "user",
-                    "content": self._user_prompt(request),
-                },
-            ],
+            "messages": self._chat_messages(request),
+            "stream": self.stream,
         }
         if self.token_limit is not None:
-            kwargs["max_output_tokens"] = self.token_limit
-        if self.reasoning_effort:
-            kwargs["reasoning"] = {"effort": self.reasoning_effort}
+            # Chat Completions-compatible providers commonly use `max_tokens`.
+            # Keep `token_limit` as the framework-level name so callers do not
+            # depend on provider-specific parameter names.
+            kwargs["max_tokens"] = self.token_limit
+        if self.reasoning_effort and self._thinking_enabled():
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.response_format:
+            kwargs["response_format"] = self.response_format
         if self.thinking:
             kwargs["extra_body"] = {"thinking": self.thinking}
         logger.debug(
-            "built OpenAI-compatible response kwargs",
+            "built OpenAI-compatible chat completion kwargs",
             extra={
                 "model": self.model,
                 "has_token_limit": self.token_limit is not None,
-                "has_reasoning_effort": bool(self.reasoning_effort),
+                "has_reasoning_effort": bool(self.reasoning_effort and self._thinking_enabled()),
+                "has_response_format": bool(self.response_format),
                 "has_thinking": bool(self.thinking),
-                "message_count": len(kwargs["input"]),
+                "stream": self.stream,
+                "message_count": len(kwargs["messages"]),
             },
         )
         return kwargs
+
+    def _thinking_enabled(self) -> bool:
+        """Return whether DeepSeek/OpenAI-compatible thinking mode is enabled.
+
+        DeepSeek V4 enables thinking by default. If config explicitly disables
+        it, reasoning effort should not be sent because there is no reasoning
+        budget to control.
+        """
+        if self.thinking is None:
+            return True
+        return self.thinking.get("type") != "disabled"
+
+    def _chat_messages(self, request: AssistantRequest) -> list[dict[str, str]]:
+        """Return Chat Completions messages while preserving workflow prompts."""
+        if request.messages:
+            return [
+                {"role": message.role, "content": message.content}
+                for message in request.messages
+            ]
+        return [
+            {"role": "system", "content": self._system_prompt(request)},
+            {"role": "user", "content": self._user_prompt(request)},
+        ]
+
+    def _chat_completion_content(self, response: Any) -> str:
+        """Extract assistant text from a Chat Completions response."""
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError) as exc:
+            raise ValueError("chat completion response did not contain assistant content") from exc
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return self._content_parts_to_text(content)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _streaming_chat_completion_content(self, stream: Any) -> str:
+        """Collect text from a Chat Completions streaming response.
+
+        The framework still returns one `AssistantResponse` in Version 1. This
+        method lets provider streaming be enabled without changing workflow
+        contracts; future CLI/API streaming can expose chunks directly.
+        """
+        text_parts: list[str] = []
+        for chunk in stream:
+            try:
+                delta = chunk.choices[0].delta
+            except (AttributeError, IndexError):
+                continue
+            content = getattr(delta, "content", None)
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                text_parts.append(self._content_parts_to_text(content))
+        return "".join(text_parts)
+
+    def _content_parts_to_text(self, parts: list[Any]) -> str:
+        """Handle providers that return message content as typed parts."""
+        text_parts: list[str] = []
+        for part in parts:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+            else:
+                text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    text_parts.append(text)
+        return "".join(text_parts)
 
     def _should_dry_run(self) -> bool:
         """Use dry-run unless explicitly disabled and an API key is available."""

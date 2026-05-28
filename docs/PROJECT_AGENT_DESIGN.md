@@ -70,6 +70,7 @@ Version 1 output must include:
 - assumptions
 - risks
 - staffing plan
+- staffing profile resolution
 - task breakdown
 - execution plan
 - final output
@@ -306,6 +307,28 @@ class StaffRolePlan(BaseModel):
     priority: int = 1
 ```
 
+### 4.8.1 StaffProfileResolution
+
+Version 1 does not create recruited staff yet, but it resolves each planned role
+to configured staff profiles so users can see whether the future project team
+can be built from current configuration.
+
+```python
+class StaffProfileMatch(BaseModel):
+    planned_role: str
+    planned_title: str
+    matched: bool
+    profile_name: str | None = None
+    profile_role: str | None = None
+    profile_title: str | None = None
+    reason: str
+```
+
+```python
+class StaffProfileResolution(BaseModel):
+    matches: list[StaffProfileMatch] = []
+```
+
 ### 4.9 ProjectResult
 
 `ProjectResult` is the structured project-level output.
@@ -337,6 +360,7 @@ class ProjectRunResult(BaseModel):
     manager_name: str
 
     result: ProjectResult | None = None
+    staffing_profile_resolution: StaffProfileResolution | None = None
     error: ProjectError | None = None
     events: list[ProjectEvent] = []
 

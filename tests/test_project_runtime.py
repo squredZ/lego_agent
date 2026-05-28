@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
+
+import pytest
 
 from lego_agent.assistants.openai_assistant import OpenAIAssistant
 from lego_agent.cli import main
@@ -9,15 +12,25 @@ from lego_agent.core.models import (
     Project,
     ProjectStatus,
     Staff,
+    StaffRolePlan,
+    StaffingPlan,
     Task,
     TaskStatus,
     WorkContext,
 )
 from lego_agent.project.config import parse_project_runtime_config
 from lego_agent.project.runtime import create_project_runtime
+from lego_agent.project.staffing import StaffProfileResolver
 from lego_agent.workflow.managers import NoopMemoryManager, NoopSkillManager, NoopToolManager
 from lego_agent.workflow.output import ProjectResultOutputParser
 from lego_agent.workflow.staff_workflow import SinglePassStaffWorkflow
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_environment(monkeypatch) -> None:
+    """Keep unit tests deterministic even when the developer has real keys set."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
 
 
 def _config() -> dict[str, object]:
@@ -40,6 +53,23 @@ def _config() -> dict[str, object]:
             }
         },
     }
+
+
+def _config_with_staff_profiles() -> dict[str, object]:
+    config = _config()
+    config["staff_profiles"]["implementation_staff"] = {
+        "name": "Iris",
+        "role": "implementation_staff",
+        "title": "Implementation Staff",
+        "responsibilities": ["implementation"],
+        "capabilities": ["code_generation", "execution_planning"],
+        "assistant": {
+            "type": "openai",
+            "model": "test-model",
+            "dry_run": True,
+        },
+    }
+    return config
 
 
 def _assistant_request(project: Project, staff: Staff) -> AssistantRequest:
@@ -109,6 +139,40 @@ def test_project_run_records_events() -> None:
     assert any(event.type == "workflow_hook" for event in result.events)
 
 
+def test_project_run_attaches_staff_profile_resolution() -> None:
+    runtime = create_project_runtime(parse_project_runtime_config(_config_with_staff_profiles()))
+
+    result = runtime.run("Build a project-oriented agent framework")
+
+    assert result.staffing_profile_resolution is not None
+    match = result.staffing_profile_resolution.matches[0]
+    assert match.matched is True
+    assert match.planned_role == "implementation_staff"
+    assert match.profile_name == "implementation_staff"
+
+
+def test_staff_profile_resolver_reports_unresolved_roles() -> None:
+    config = parse_project_runtime_config(_config())
+    staffing_plan = StaffingPlan(
+        required_roles=[
+            StaffRolePlan(
+                role="security_staff",
+                title="Security Staff",
+                responsibilities=["review"],
+                capabilities=["quality_review"],
+                task_focus="Review security risks.",
+            )
+        ],
+        rationale="Security review is required.",
+    )
+
+    resolution = StaffProfileResolver(config.staff_profiles).resolve(staffing_plan)
+
+    assert len(resolution.unresolved) == 1
+    assert resolution.unresolved[0].planned_role == "security_staff"
+    assert "No configured staff profile" in resolution.unresolved[0].reason
+
+
 def test_project_run_emits_useful_logs(caplog) -> None:
     caplog.set_level(logging.DEBUG)
     runtime = create_project_runtime(parse_project_runtime_config(_config()))
@@ -168,8 +232,21 @@ def test_workflow_adds_project_result_output_contract() -> None:
     assert result.status == TaskStatus.DONE
     assert request.output_contract.name == "ProjectResult"
     assert request.output_schema["title"] == "ProjectResult"
-    assert "ProjectResult" in request.messages[-1].content
-    assert "Return only valid JSON" in request.messages[-1].content
+    system_prompt = request.messages[0].content
+    user_prompt = request.messages[-1].content
+    assert "You are Ava, Project Manager." in system_prompt
+    assert "Role: project_manager" in system_prompt
+    assert "Responsibilities:" in system_prompt
+    assert "requirements_analysis" in system_prompt
+    assert "planning" in system_prompt
+    assert "staffing" in system_prompt
+    assert "Capabilities:" in system_prompt
+    assert "task_decomposition" in system_prompt
+    assert "staff_recruitment" in system_prompt
+    assert "ProjectResult" in user_prompt
+    assert "Return exactly one JSON object" in user_prompt
+    assert "Do not use Markdown fences" in user_prompt
+    assert "at most 3 assumptions" in user_prompt
 
 
 def test_failed_workflow_records_error_events() -> None:
@@ -270,6 +347,8 @@ def test_assistant_config_matches_openai_runtime_options() -> None:
         "timeout_seconds": 30,
         "thinking": {"type": "enabled"},
         "reasoning_effort": "high",
+        "response_format": {"type": "json_object"},
+        "stream": True,
         "tokenlimit": 4096,
         "dry_run": True,
     }
@@ -285,7 +364,97 @@ def test_assistant_config_matches_openai_runtime_options() -> None:
     assert assistant.timeout_seconds == 30
     assert assistant.thinking == {"type": "enabled"}
     assert assistant.reasoning_effort == "high"
+    assert assistant.response_format == {"type": "json_object"}
+    assert assistant.stream is True
     assert assistant.token_limit == 4096
+
+
+def test_openai_assistant_builds_chat_completion_kwargs() -> None:
+    staff = Staff(
+        id="pm",
+        project_id="project",
+        name="Ava",
+        role="project_manager",
+        title="Project Manager",
+    )
+    project = Project(goal="Plan", manager_id="pm", staff={"pm": staff})
+    request = _assistant_request(project, staff)
+    assistant = OpenAIAssistant(
+        model="deepseek-v4-pro",
+        token_limit=4096,
+        reasoning_effort="high",
+        response_format={"type": "json_object"},
+        thinking={"type": "enabled"},
+        stream=True,
+    )
+
+    kwargs = assistant._chat_completion_kwargs(request)
+
+    assert kwargs["model"] == "deepseek-v4-pro"
+    assert kwargs["max_tokens"] == 4096
+    assert kwargs["reasoning_effort"] == "high"
+    assert kwargs["response_format"] == {"type": "json_object"}
+    assert kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert kwargs["stream"] is True
+    assert kwargs["messages"][0]["role"] == "system"
+    assert kwargs["messages"][1]["role"] == "user"
+    assert "input" not in kwargs
+    assert "max_output_tokens" not in kwargs
+
+
+def test_openai_assistant_disables_reasoning_effort_when_thinking_is_disabled() -> None:
+    staff = Staff(
+        id="pm",
+        project_id="project",
+        name="Ava",
+        role="project_manager",
+        title="Project Manager",
+    )
+    project = Project(goal="Plan", manager_id="pm", staff={"pm": staff})
+    request = _assistant_request(project, staff)
+    assistant = OpenAIAssistant(
+        model="deepseek-v4-pro",
+        reasoning_effort="high",
+        thinking={"type": "disabled"},
+    )
+
+    kwargs = assistant._chat_completion_kwargs(request)
+
+    assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in kwargs
+
+
+def test_openai_assistant_extracts_chat_completion_content() -> None:
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content='{"summary": "ok"}'),
+            )
+        ]
+    )
+
+    content = OpenAIAssistant()._chat_completion_content(response)
+
+    assert content == '{"summary": "ok"}'
+
+
+def test_openai_assistant_collects_streaming_chat_completion_content() -> None:
+    stream = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content='{"summary": '))
+            ]
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content='"ok"}'))
+            ]
+        ),
+    ]
+
+    content = OpenAIAssistant(stream=True)._streaming_chat_completion_content(stream)
+
+    assert content == '{"summary": "ok"}'
 
 
 def test_openai_assistant_uses_env_api_key_for_live_mode(monkeypatch) -> None:
@@ -372,6 +541,25 @@ def test_cli_human_output_can_show_events(capsys) -> None:
     assert "events:" in output
     assert "project_created" in output
     assert "workflow_started" in output
+
+
+def test_cli_human_output_can_show_staffing_matches(capsys) -> None:
+    exit_code = main(
+        [
+            "project",
+            "run",
+            "--config",
+            "configs/project_runtime.json",
+            "--staffing-matches",
+            "Build a project-oriented agent framework",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "staffing profile matches:" in output
+    assert "implementation_staff" in output
+    assert "Implementation Staff" in output
 
 
 def test_cli_reports_config_errors(capsys) -> None:

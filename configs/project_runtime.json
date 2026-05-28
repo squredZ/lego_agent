@@ -26,8 +26,91 @@
       ],
       "assistant": {
         "type": "openai",
+        "model": "deepseek-v4-pro",
+        "base_url": "https://api.deepseek.com",
+        "timeout_seconds": 120,
+        "stream": false,
+        "response_format": {
+          "type": "json_object"
+        },
+        "thinking": {
+          "type": "enabled"
+        },
+        "token_limit": 384000
+      }
+    },
+    "implementation_staff": {
+      "name": "Iris",
+      "role": "implementation_staff",
+      "title": "Implementation Staff",
+      "responsibilities": [
+        "implementation"
+      ],
+      "capabilities": [
+        "code_generation",
+        "execution_planning"
+      ],
+      "assistant": {
+        "type": "openai",
         "model": "gpt-4.1-mini",
         "timeout_seconds": 30,
+        "stream": false,
+        "token_limit": 4096
+      }
+    },
+    "review_staff": {
+      "name": "Ravi",
+      "role": "review_staff",
+      "title": "Review Staff",
+      "responsibilities": [
+        "review",
+        "acceptance"
+      ],
+      "capabilities": [
+        "quality_review"
+      ],
+      "assistant": {
+        "type": "openai",
+        "model": "gpt-4.1-mini",
+        "timeout_seconds": 30,
+        "stream": false,
+        "token_limit": 4096
+      }
+    },
+    "testing_staff": {
+      "name": "Tess",
+      "role": "testing_staff",
+      "title": "Testing Staff",
+      "responsibilities": [
+        "testing"
+      ],
+      "capabilities": [
+        "quality_review",
+        "execution_planning"
+      ],
+      "assistant": {
+        "type": "openai",
+        "model": "gpt-4.1-mini",
+        "timeout_seconds": 30,
+        "stream": false,
+        "token_limit": 4096
+      }
+    },
+    "research_staff": {
+      "name": "Nora",
+      "role": "research_staff",
+      "title": "Research Staff",
+      "responsibilities": [
+        "requirements_analysis"
+      ],
+      "capabilities": [
+        "task_decomposition"
+      ],
+      "assistant": {
+        "type": "openai",
+        "model": "gpt-4.1-mini",
+        "timeout_seconds": 30,
+        "stream": false,
         "token_limit": 4096
       }
     }

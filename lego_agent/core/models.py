@@ -172,6 +172,29 @@ class ProjectResult(BaseModel):
     final_output: str
 
 
+class StaffProfileMatch(BaseModel):
+    """Result of matching one planned role to a configured staff profile."""
+
+    planned_role: str
+    planned_title: str
+    matched: bool
+    profile_name: str | None = None
+    profile_role: str | None = None
+    profile_title: str | None = None
+    reason: str
+
+
+class StaffProfileResolution(BaseModel):
+    """All configured profile matches for one project staffing plan."""
+
+    matches: list[StaffProfileMatch] = Field(default_factory=list)
+
+    @property
+    def unresolved(self) -> list[StaffProfileMatch]:
+        """Return planned roles that cannot be created from current config."""
+        return [match for match in self.matches if not match.matched]
+
+
 class OutputContract(BaseModel):
     """Describes the structured output expected from an assistant."""
 
@@ -231,6 +254,7 @@ class ProjectRunResult(BaseModel):
     manager_id: str
     manager_name: str
     result: ProjectResult | None = None
+    staffing_profile_resolution: StaffProfileResolution | None = None
     error: ProjectError | None = None
     events: list[ProjectEvent] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=utc_now)
