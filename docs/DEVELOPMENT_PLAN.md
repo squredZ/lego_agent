@@ -471,6 +471,9 @@ Acceptance:
 Status: complete for current Version 1 scope.
 
 Objective: prepare for dynamic staffing without executing recruited staff yet.
+Configured staff profiles are templates, not a whitelist. Missing profiles no
+longer block project-manager planning output when dynamic staff creation is
+enabled.
 
 Tasks:
 
@@ -481,14 +484,16 @@ Tasks:
    - research staff
    Status: done.
 2. Add `StaffProfileResolver`: done.
-3. Match `StaffRolePlan.role` to configured profiles: done.
-4. Return unresolved roles clearly: done.
+3. Match `StaffRolePlan.role` to configured profiles when templates exist: done.
+4. Mark roles without templates as dynamically creatable when `dynamic_staff.enabled=true`: done.
 5. Add CLI option to print planned staff profile matches: done.
+6. Add `DynamicStaffConfig`: done.
+7. Add `StaffFactory` for profile-template or dynamic staff creation: done.
 
 Acceptance:
 
-- PM staffing plan can be matched against configured profiles.
-- Missing profile cases are tested.
+- PM staffing plan can be matched against configured profiles when profiles exist.
+- Missing profile cases are treated as dynamic staff when dynamic staff is enabled.
 - Human CLI output can show planned role/profile matches with `--staffing-matches`.
 
 ## Version 2 Plan: Dynamic Staff Creation and Execution
@@ -508,7 +513,19 @@ Staff do not directly call other Staff.
 They coordinate through Task state, Events, Messages, and the Orchestrator.
 ```
 
+Staffing rule:
+
+```text
+Only the project manager is mandatory and preconfigured.
+Other project staff are created from the project manager's staffing plan.
+Configured staff profiles are reusable templates, not a whitelist.
+```
+
 ### Version 2A: Synchronous Multi-Staff Semantics
+
+Status: in progress. Foundation models and in-memory collaboration components
+are implemented; orchestration that creates and runs recruited staff is still
+pending.
 
 Objective: model multi-staff collaboration without real concurrency.
 
@@ -517,26 +534,37 @@ Tasks:
 1. Add interaction models:
    - `StaffMessage`
    - `StaffInbox`
+   Status: done.
 2. Add state/communication interfaces:
    - `TaskStore`
    - `MessageBus`
    - optional `EventBus`
+   Status: `TaskStore` and `MessageBus` done; `EventBus` remains optional.
 3. Add in-memory implementations:
    - `InMemoryTaskStore`
    - `InMemoryMessageBus`
+   Status: done.
 4. Add coordination helpers:
    - `TaskDispatcher`
    - `TaskCompletionHandler`
-5. Runtime maps `StaffRolePlan` to `StaffProfileConfig`.
+   Status: done.
+5. Runtime maps `StaffRolePlan` to profile templates or dynamic staff creation.
+   Status: foundation done through `StaffProfileResolver`, `DynamicStaffConfig`, and `StaffFactory`;
+   orchestration integration pending.
 6. Runtime creates recruited staff inside the project.
+   Status: foundation done through `StaffFactory`; orchestration integration pending.
 7. Runtime creates child tasks assigned to recruited staff.
+   Status: pending.
 8. Staff execute child tasks one by one through `SinglePassStaffWorkflow`.
+   Status: pending.
 9. Child task completion updates task state, emits task events, and sends manager inbox messages.
+   Status: foundation done through `TaskCompletionHandler`; orchestration integration pending.
 10. Manager reviews after all child tasks complete.
+   Status: pending.
 
 Acceptance:
 
-- A project can create at least two recruited staff from profiles.
+- A project can create at least two recruited staff from profile templates or dynamic role plans.
 - Recruited staff receive child tasks.
 - Each child task completion creates:
   - updated task state

@@ -91,12 +91,22 @@ class OrchestrationConfig(BaseModel):
     strategy: str = "project_manager_only"
 
 
+class DynamicStaffConfig(BaseModel):
+    """Controls staff created from project-manager staffing plans."""
+
+    enabled: bool = True
+    default_assistant: AssistantConfig = Field(default_factory=AssistantConfig)
+    allow_dynamic_responsibilities: bool = True
+    allow_dynamic_capabilities: bool = True
+
+
 class ProjectRuntimeConfig(BaseModel):
     """Top-level runtime configuration loaded from JSON."""
 
     project: ProjectDefaultsConfig = Field(default_factory=ProjectDefaultsConfig)
     orchestration: OrchestrationConfig = Field(default_factory=OrchestrationConfig)
     staff_profiles: dict[str, StaffProfileConfig]
+    dynamic_staff: DynamicStaffConfig = Field(default_factory=DynamicStaffConfig)
     modules: list[str] = Field(default_factory=list)
 
 

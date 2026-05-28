@@ -173,11 +173,16 @@ class ProjectResult(BaseModel):
 
 
 class StaffProfileMatch(BaseModel):
-    """Result of matching one planned role to a configured staff profile."""
+    """How one planned role should become project staff.
+
+    Configured profiles are reusable templates. If no template exists, dynamic
+    creation can still build staff directly from the project manager's plan.
+    """
 
     planned_role: str
     planned_title: str
     matched: bool
+    source: str = "profile"
     profile_name: str | None = None
     profile_role: str | None = None
     profile_title: str | None = None
@@ -303,6 +308,38 @@ class TaskEvent(BaseModel):
 class Message(BaseModel):
     role: str
     content: str
+
+
+class StaffMessage(BaseModel):
+    """Notification sent between staff through a message bus.
+
+    Staff should not call each other directly. Messages are lightweight
+    notifications; task state remains the source of truth.
+    """
+
+    id: str = Field(default_factory=new_id)
+    project_id: str
+    sender_id: str
+    recipient_id: str
+    type: str
+    content: str
+    task_id: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+    read_at: datetime | None = None
+
+
+class StaffInbox(BaseModel):
+    """Unread and historical messages for one staff member in one project."""
+
+    staff_id: str
+    project_id: str
+    messages: list[StaffMessage] = Field(default_factory=list)
+
+    @property
+    def unread(self) -> list[StaffMessage]:
+        """Return messages that have not been marked read."""
+        return [message for message in self.messages if message.read_at is None]
 
 
 class AssistantRequest(BaseModel):

@@ -142,10 +142,15 @@ def _print_human_result(
         print("staffing profile matches:")
         for match in run_result.staffing_profile_resolution.matches:
             if match.matched:
-                print(
-                    f"- {match.planned_title} ({match.planned_role}) -> "
-                    f"{match.profile_title} ({match.profile_name})"
-                )
+                if match.source == "profile":
+                    print(
+                        f"- {match.planned_title} ({match.planned_role}) -> "
+                        f"{match.profile_title} ({match.profile_name})"
+                    )
+                elif match.source == "dynamic":
+                    print(f"- {match.planned_title} ({match.planned_role}) -> dynamic staff")
+                else:
+                    print(f"- {match.planned_title} ({match.planned_role}) -> {match.source}")
             else:
                 print(f"- {match.planned_title} ({match.planned_role}) -> unresolved: {match.reason}")
 

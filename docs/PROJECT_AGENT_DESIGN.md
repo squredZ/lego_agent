@@ -310,14 +310,17 @@ class StaffRolePlan(BaseModel):
 ### 4.8.1 StaffProfileResolution
 
 Version 1 does not create recruited staff yet, but it resolves each planned role
-to configured staff profiles so users can see whether the future project team
-can be built from current configuration.
+so users can see how the future project team would be built. Configured staff
+profiles are templates, not a whitelist. If a planned role has no template and
+dynamic staff is enabled, the runtime can still create staff directly from the
+project manager's `StaffRolePlan`.
 
 ```python
 class StaffProfileMatch(BaseModel):
     planned_role: str
     planned_title: str
     matched: bool
+    source: str = "profile"
     profile_name: str | None = None
     profile_role: str | None = None
     profile_title: str | None = None
@@ -328,6 +331,12 @@ class StaffProfileMatch(BaseModel):
 class StaffProfileResolution(BaseModel):
     matches: list[StaffProfileMatch] = []
 ```
+
+`source` describes how the role will be created:
+
+- `profile`: use a configured profile as a template.
+- `dynamic`: create staff from the AI-generated staffing plan.
+- `unresolved`: cannot create staff because dynamic creation is disabled and no profile exists.
 
 ### 4.9 ProjectResult
 
@@ -823,6 +832,25 @@ The new configuration should be project runtime oriented.
   "orchestration": {
     "strategy": "project_manager_only"
   },
+  "dynamic_staff": {
+    "enabled": true,
+    "default_assistant": {
+      "type": "openai",
+      "model": "deepseek-v4-pro",
+      "base_url": "https://api.deepseek.com",
+      "timeout_seconds": 120,
+      "stream": false,
+      "response_format": {
+        "type": "json_object"
+      },
+      "thinking": {
+        "type": "disabled"
+      },
+      "token_limit": 4096
+    },
+    "allow_dynamic_responsibilities": true,
+    "allow_dynamic_capabilities": true
+  },
   "staff_profiles": {
     "project_manager": {
       "name": "Ava",
@@ -845,8 +873,14 @@ The new configuration should be project runtime oriented.
         "type": "openai",
         "model": "deepseek-v4-pro",
         "base_url": "https://api.deepseek.com",
-        "timeout_seconds": 30,
-        "reasoning_effort": "high",
+        "timeout_seconds": 120,
+        "stream": false,
+        "response_format": {
+          "type": "json_object"
+        },
+        "thinking": {
+          "type": "disabled"
+        },
         "token_limit": 4096
       }
     }
@@ -854,6 +888,11 @@ The new configuration should be project runtime oriented.
   "modules": []
 }
 ```
+
+Only the project manager must be configured up front. Other profiles are
+optional templates. If the project manager plans a role that has no configured
+template, `dynamic_staff` controls whether the runtime may create that staff
+from the plan.
 
 ## 10. CLI Design
 
@@ -930,7 +969,7 @@ Manager awareness should come from:
 3. Project/task events for audit and debugging.
 4. Staff status as supporting information.
 
-### 11.1.2 Proposed Models
+### 11.1.2 Interaction Models
 
 ```python
 class StaffMessage(BaseModel):
@@ -953,7 +992,9 @@ class StaffInbox(BaseModel):
     messages: list[StaffMessage] = []
 ```
 
-### 11.1.3 Proposed Interfaces
+These models are implemented in `lego_agent.core.models`.
+
+### 11.1.3 Interaction Interfaces and In-Memory Implementations
 
 ```python
 class TaskStore(Protocol):
@@ -965,10 +1006,21 @@ class TaskStore(Protocol):
 
 ```python
 class MessageBus(Protocol):
-    def send(self, message: StaffMessage) -> None: ...
+    def send(self, message: StaffMessage) -> StaffMessage: ...
+    def inbox_for(self, staff_id: str, project_id: str) -> list[StaffMessage]: ...
     def unread_for(self, staff_id: str, project_id: str) -> list[StaffMessage]: ...
-    def mark_read(self, message_id: str) -> None: ...
+    def mark_read(self, message_id: str) -> StaffMessage: ...
 ```
+
+Version 2A starts with:
+
+- `InMemoryTaskStore`
+- `InMemoryMessageBus`
+
+They are implemented in `lego_agent.project.interaction`. The stores keep the
+same boundary that later SQLite/Postgres/Redis implementations should provide.
+
+### 11.1.4 Coordination Helpers
 
 ```python
 class TaskDispatcher:
@@ -978,7 +1030,7 @@ class TaskDispatcher:
         task: Task,
         assignee: Staff,
         created_by: Staff,
-    ) -> None:
+    ) -> Task:
         ...
 ```
 
@@ -990,11 +1042,13 @@ class TaskCompletionHandler:
         task: Task,
         staff: Staff,
         result: WorkResult,
-    ) -> None:
+    ) -> Task:
         ...
 ```
 
-### 11.1.4 Manager Notification Flow
+These helpers are implemented in `lego_agent.project.interaction`.
+
+### 11.1.5 Manager Notification Flow
 
 ```mermaid
 sequenceDiagram
@@ -1018,7 +1072,7 @@ sequenceDiagram
     O->>M: wake for review/synthesis
 ```
 
-### 11.1.5 Implementation Strategy
+### 11.1.6 Implementation Strategy
 
 Do not start with distributed async execution.
 

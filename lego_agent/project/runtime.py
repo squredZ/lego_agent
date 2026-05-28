@@ -222,7 +222,7 @@ class ProjectRuntime:
         if result.result is None:
             logger.debug("skipping staff profile resolution because project result is empty")
             return
-        resolver = StaffProfileResolver(self.config.staff_profiles)
+        resolver = StaffProfileResolver(self.config.staff_profiles, self.config.dynamic_staff)
         result.staffing_profile_resolution = resolver.resolve(result.result.staffing_plan)
         logger.info(
             "staffing profile resolution attached to run result",

@@ -12,15 +12,25 @@ from lego_agent.core.models import (
     Project,
     ProjectStatus,
     Staff,
+    StaffInbox,
+    StaffMessage,
     StaffRolePlan,
     StaffingPlan,
     Task,
     TaskStatus,
+    WorkResult,
     WorkContext,
 )
 from lego_agent.project.config import parse_project_runtime_config
+from lego_agent.project.events import EventRecorder
+from lego_agent.project.interaction import (
+    InMemoryMessageBus,
+    InMemoryTaskStore,
+    TaskCompletionHandler,
+    TaskDispatcher,
+)
 from lego_agent.project.runtime import create_project_runtime
-from lego_agent.project.staffing import StaffProfileResolver
+from lego_agent.project.staffing import StaffFactory, StaffProfileResolver
 from lego_agent.workflow.managers import NoopMemoryManager, NoopSkillManager, NoopToolManager
 from lego_agent.workflow.output import ProjectResultOutputParser
 from lego_agent.workflow.staff_workflow import SinglePassStaffWorkflow
@@ -88,6 +98,31 @@ def _manager_task(project: Project) -> Task:
     return next(iter(project.tasks.values()))
 
 
+def _project_with_worker() -> tuple[Project, Staff, Staff]:
+    manager = Staff(
+        id="project_manager",
+        project_id="project",
+        name="Ava",
+        role="project_manager",
+        title="Project Manager",
+    )
+    worker = Staff(
+        id="implementation_staff",
+        project_id="project",
+        name="Iris",
+        role="implementation_staff",
+        title="Implementation Staff",
+        manager_id=manager.id,
+    )
+    project = Project(
+        id="project",
+        goal="Build",
+        manager_id=manager.id,
+        staff={manager.id: manager, worker.id: worker},
+    )
+    return project, manager, worker
+
+
 def test_project_model_requires_project_manager_role() -> None:
     manager = Staff(
         id="pm",
@@ -103,6 +138,106 @@ def test_project_model_requires_project_manager_role() -> None:
         assert "project_manager" in str(exc)
     else:
         raise AssertionError("expected invalid manager role to fail")
+
+
+def test_staff_inbox_exposes_unread_messages() -> None:
+    read_message = StaffMessage(
+        project_id="project",
+        sender_id="manager",
+        recipient_id="worker",
+        type="task_assigned",
+        content="Read message.",
+    )
+    read_message.read_at = read_message.created_at
+    unread_message = StaffMessage(
+        project_id="project",
+        sender_id="manager",
+        recipient_id="worker",
+        type="task_assigned",
+        content="Unread message.",
+    )
+
+    inbox = StaffInbox(
+        staff_id="worker",
+        project_id="project",
+        messages=[read_message, unread_message],
+    )
+
+    assert inbox.unread == [unread_message]
+
+
+def test_in_memory_message_bus_tracks_unread_messages() -> None:
+    bus = InMemoryMessageBus()
+    message = bus.send(
+        StaffMessage(
+            project_id="project",
+            sender_id="manager",
+            recipient_id="worker",
+            type="task_assigned",
+            content="Please handle this task.",
+        )
+    )
+
+    assert bus.unread_for("worker", "project") == [message]
+
+    bus.mark_read(message.id)
+
+    assert bus.unread_for("worker", "project") == []
+
+
+def test_task_dispatcher_assigns_task_and_notifies_worker() -> None:
+    project, manager, worker = _project_with_worker()
+    task_store = InMemoryTaskStore(project)
+    message_bus = InMemoryMessageBus()
+    event_recorder = EventRecorder()
+    dispatcher = TaskDispatcher(task_store, message_bus, event_recorder)
+    child_task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        parent_task_id="manager-task",
+    )
+
+    dispatcher.assign(project, child_task, worker, manager)
+
+    assert project.tasks[child_task.id].assigned_to == worker.id
+    assert project.tasks[child_task.id].created_by == manager.id
+    assert message_bus.unread_for(worker.id, project.id)[0].type == "task_assigned"
+    assert any(event.type == "task_assigned" for event in project.events)
+    assert any(event.type == "task_assigned" for event in child_task.events)
+
+
+def test_task_completion_handler_notifies_manager() -> None:
+    project, manager, worker = _project_with_worker()
+    child_task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+        parent_task_id="manager-task",
+    )
+    project.tasks[child_task.id] = child_task
+    task_store = InMemoryTaskStore(project)
+    message_bus = InMemoryMessageBus()
+    event_recorder = EventRecorder()
+    completion_handler = TaskCompletionHandler(task_store, message_bus, event_recorder)
+    work_result = WorkResult(
+        staff_id=worker.id,
+        task_id=child_task.id,
+        status=TaskStatus.DONE,
+        output="Implemented core runtime.",
+    )
+
+    completion_handler.complete(project, child_task, worker, work_result)
+
+    assert project.tasks[child_task.id].status == TaskStatus.DONE
+    assert project.tasks[child_task.id].result == "Implemented core runtime."
+    manager_messages = message_bus.unread_for(manager.id, project.id)
+    assert manager_messages[0].type == "task_completed"
+    assert manager_messages[0].sender_id == worker.id
+    assert any(event.type == "task_completed" for event in project.events)
+    assert any(event.type == "task_completed" for event in child_task.events)
 
 
 def test_parses_project_runtime_config() -> None:
@@ -149,9 +284,10 @@ def test_project_run_attaches_staff_profile_resolution() -> None:
     assert match.matched is True
     assert match.planned_role == "implementation_staff"
     assert match.profile_name == "implementation_staff"
+    assert match.source == "profile"
 
 
-def test_staff_profile_resolver_reports_unresolved_roles() -> None:
+def test_staff_profile_resolver_marks_unknown_roles_as_dynamic() -> None:
     config = parse_project_runtime_config(_config())
     staffing_plan = StaffingPlan(
         required_roles=[
@@ -166,11 +302,38 @@ def test_staff_profile_resolver_reports_unresolved_roles() -> None:
         rationale="Security review is required.",
     )
 
-    resolution = StaffProfileResolver(config.staff_profiles).resolve(staffing_plan)
+    resolution = StaffProfileResolver(config.staff_profiles, config.dynamic_staff).resolve(staffing_plan)
 
-    assert len(resolution.unresolved) == 1
-    assert resolution.unresolved[0].planned_role == "security_staff"
-    assert "No configured staff profile" in resolution.unresolved[0].reason
+    assert resolution.unresolved == []
+    assert resolution.matches[0].matched is True
+    assert resolution.matches[0].source == "dynamic"
+    assert "created dynamically" in resolution.matches[0].reason
+
+
+def test_staff_factory_creates_dynamic_staff_from_role_plan() -> None:
+    config = parse_project_runtime_config(_config())
+    role_plan = StaffRolePlan(
+        role="security_staff",
+        title="Security Staff",
+        responsibilities=["security_review"],
+        capabilities=["threat_modeling"],
+        task_focus="Review security risks.",
+    )
+    factory = StaffFactory(
+        config.staff_profiles,
+        config.dynamic_staff,
+        lambda assistant_config: OpenAIAssistant(**assistant_config.to_assistant_kwargs()),
+    )
+
+    staff = factory.create_from_plan(role_plan, "project", manager_id="project_manager")
+
+    assert staff.id == "security_staff"
+    assert staff.role == "security_staff"
+    assert staff.title == "Security Staff"
+    assert staff.manager_id == "project_manager"
+    assert staff.responsibilities[0].name == "security_review"
+    assert staff.capabilities[0].name == "threat_modeling"
+    assert isinstance(staff.assistant, OpenAIAssistant)
 
 
 def test_project_run_emits_useful_logs(caplog) -> None:

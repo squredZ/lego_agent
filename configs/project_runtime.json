@@ -5,6 +5,25 @@
   "orchestration": {
     "strategy": "project_manager_only"
   },
+  "dynamic_staff": {
+    "enabled": true,
+    "default_assistant": {
+      "type": "openai",
+      "model": "deepseek-v4-pro",
+      "base_url": "https://api.deepseek.com",
+      "timeout_seconds": 120,
+      "stream": false,
+      "response_format": {
+        "type": "json_object"
+      },
+      "thinking": {
+        "type": "disabled"
+      },
+      "token_limit": 4096
+    },
+    "allow_dynamic_responsibilities": true,
+    "allow_dynamic_capabilities": true
+  },
   "staff_profiles": {
     "project_manager": {
       "name": "Ava",
