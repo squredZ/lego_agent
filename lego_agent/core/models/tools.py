@@ -16,6 +16,7 @@ class ToolSpec(BaseModel):
 class ToolCall(BaseModel):
     """One assistant-requested tool invocation."""
 
+    id: str | None = Field(default=None, description="Provider tool call id used to correlate tool results.")
     tool_name: str = Field(description="Name of the requested tool.")
     arguments: dict[str, Any] = Field(default_factory=dict, description="Validated or raw arguments for the tool.")
 

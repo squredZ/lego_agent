@@ -884,6 +884,40 @@ tools:
 This keeps tools composable while still allowing future adapters for file,
 shell, web, search, or external API actions.
 
+The current V2B-2 `BuiltinToolManager` may contain the first built-in tools
+directly as a minimal implementation. That should not become the long-term
+extension model. The next tool architecture should introduce a registry and
+independent tool classes:
+
+```python
+class Tool(Protocol):
+    name: str
+    description: str
+    parameters_schema: dict[str, Any]
+
+    def call(self, arguments: dict[str, Any]) -> ToolResult:
+        ...
+```
+
+```python
+class ToolRegistry:
+    def register(self, tool: Tool) -> None: ...
+    def get(self, name: str) -> Tool: ...
+    def list(self) -> list[Tool]: ...
+```
+
+Target responsibilities:
+
+- `ToolRegistry` owns tool lookup and registration.
+- `BuiltinToolManager` owns enabled-tool checks, logging, error handling, and
+  delegation to registered tools.
+- Concrete tools such as `EchoTool` and `ReadProjectFileTool` own their own
+  schema and execution logic.
+- Adding a new built-in tool should not require editing `BuiltinToolManager`.
+
+This preserves SOLID boundaries while keeping the external `ToolManager`
+contract stable for workflows.
+
 ### 7.3 SkillManager
 
 ```python

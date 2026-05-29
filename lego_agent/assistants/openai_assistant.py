@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ from lego_agent.core.models import (
     StaffRolePlan,
     StaffingPlan,
     TaskExecutionResult,
+    ToolCall,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,11 +80,9 @@ class OpenAIAssistant:
 
         client = OpenAI(**client_kwargs)
         response = client.chat.completions.create(**self._chat_completion_kwargs(request))
-        content = (
-            self._streaming_chat_completion_content(response)
-            if self.stream
-            else self._chat_completion_content(response)
-        )
+        content = self._response_content(response)
+        tool_calls = [] if self.stream else self._chat_completion_tool_calls(response)
+        finish_reason = None if self.stream else self._chat_completion_finish_reason(response)
         logger.info(
             "assistant received OpenAI-compatible response",
             extra={
@@ -91,9 +91,15 @@ class OpenAIAssistant:
                 "task_id": request.task.id,
                 "model": self.model,
                 "content_length": len(content),
+                "tool_call_count": len(tool_calls),
             },
         )
-        return AssistantResponse(content=content, raw=response)
+        return AssistantResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            raw=response,
+        )
 
     def _chat_completion_kwargs(self, request: AssistantRequest) -> dict[str, Any]:
         """Map framework request fields to Chat Completions parameters."""
@@ -163,6 +169,55 @@ class OpenAIAssistant:
         if content is None:
             return ""
         return str(content)
+
+    def _response_content(self, response: Any) -> str:
+        """Extract response text for streaming and non-streaming calls."""
+        if self.stream:
+            return self._streaming_chat_completion_content(response)
+        return self._chat_completion_content(response)
+
+    def _chat_completion_finish_reason(self, response: Any) -> str | None:
+        """Return provider finish reason when available."""
+        try:
+            finish_reason = response.choices[0].finish_reason
+        except (AttributeError, IndexError):
+            return None
+        return str(finish_reason) if finish_reason is not None else None
+
+    def _chat_completion_tool_calls(self, response: Any) -> list[ToolCall]:
+        """Map OpenAI Chat Completions tool calls into framework ToolCall."""
+        try:
+            raw_tool_calls = response.choices[0].message.tool_calls
+        except (AttributeError, IndexError):
+            return []
+        if not raw_tool_calls:
+            return []
+        return [self._tool_call_from_openai(item) for item in raw_tool_calls]
+
+    def _tool_call_from_openai(self, raw_tool_call: Any) -> ToolCall:
+        """Convert one provider tool call while tolerating SDK object shapes."""
+        function = getattr(raw_tool_call, "function", None)
+        name = getattr(function, "name", None) if function is not None else None
+        arguments = getattr(function, "arguments", "{}") if function is not None else "{}"
+        parsed_arguments = self._parse_tool_arguments(arguments)
+        return ToolCall(
+            id=getattr(raw_tool_call, "id", None),
+            tool_name=str(name or ""),
+            arguments=parsed_arguments,
+        )
+
+    def _parse_tool_arguments(self, arguments: Any) -> dict[str, Any]:
+        """Parse JSON string tool arguments into a dictionary."""
+        if isinstance(arguments, dict):
+            return arguments
+        if not isinstance(arguments, str) or not arguments:
+            return {}
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            logger.warning("failed to parse tool call arguments")
+            return {"raw_arguments": arguments}
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
 
     def _streaming_chat_completion_content(self, stream: Any) -> str:
         """Collect text from a Chat Completions streaming response.

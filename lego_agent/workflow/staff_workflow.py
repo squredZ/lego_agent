@@ -17,6 +17,8 @@ from lego_agent.core.models import (
     TaskError,
     TaskExecutionResult,
     TaskStatus,
+    ToolCall,
+    ToolResult,
     ToolSpec,
     WorkContext,
     WorkResult,
@@ -531,10 +533,25 @@ class IterativeStaffWorkflow(SinglePassStaffWorkflow):
             request = self.plan_work(project, staff, task, context, skills, tools, memories)
 
             output_retry_count = 0
+            tool_call_count = 0
             last_error: Exception | None = None
             for step_number in range(1, self.workflow_config.max_steps + 1):
                 self._record_step_started(project, staff, task, step_number)
                 response = self.execute_work(staff, request)
+                if response.tool_calls:
+                    tool_call_count += len(response.tool_calls)
+                    if tool_call_count > self.workflow_config.max_tool_calls:
+                        raise ValueError("workflow exceeded max_tool_calls")
+                    tool_results = self.execute_tool_calls(
+                        project,
+                        staff,
+                        task,
+                        step_number,
+                        response.tool_calls,
+                    )
+                    request.messages.append(self._tool_results_message(tool_results))
+                    self._record_step_completed(project, staff, task, step_number, "tool_calls")
+                    continue
                 try:
                     parsed_output = self.parse_output_strict(response.content, project, staff, task)
                 except Exception as exc:
@@ -564,7 +581,11 @@ class IterativeStaffWorkflow(SinglePassStaffWorkflow):
                     f"Iterative workflow completed for task '{task.title}'.",
                     actor_id=staff.id,
                     task_id=task.id,
-                    data={"step_count": step_number, "output_retry_count": output_retry_count},
+                    data={
+                        "step_count": step_number,
+                        "output_retry_count": output_retry_count,
+                        "tool_call_count": tool_call_count,
+                    },
                 )
                 logger.info(
                     "iterative staff workflow completed",
@@ -615,6 +636,59 @@ class IterativeStaffWorkflow(SinglePassStaffWorkflow):
         if staff.role == "project_manager":
             return self.output_parser.parse_strict(content, project)
         return self.task_output_parser.parse_strict(content, project, task)
+
+    def execute_tool_calls(
+        self,
+        project: Project,
+        staff: Staff,
+        task: Task,
+        step_number: int,
+        tool_calls: list[ToolCall],
+    ) -> list[ToolResult]:
+        """Execute assistant-requested tools through the configured manager."""
+        results: list[ToolResult] = []
+        for call in tool_calls:
+            self.event_recorder.project_event(
+                project,
+                "tool_call_requested",
+                f"Assistant requested tool '{call.tool_name}'.",
+                actor_id=staff.id,
+                task_id=task.id,
+                data={"step": step_number, "tool_name": call.tool_name, "tool_call_id": call.id},
+            )
+            result = self.tool_manager.call_tool(call)
+            results.append(result)
+            event_type = "tool_call_completed" if result.success else "tool_call_failed"
+            event_level = EventLevel.INFO if result.success else EventLevel.ERROR
+            self.event_recorder.project_event(
+                project,
+                event_type,
+                f"Tool '{call.tool_name}' finished.",
+                level=event_level,
+                actor_id=staff.id,
+                task_id=task.id,
+                data={
+                    "step": step_number,
+                    "tool_name": call.tool_name,
+                    "tool_call_id": call.id,
+                    "success": result.success,
+                },
+            )
+            if not result.success and self.workflow_config.fail_on_tool_error:
+                raise ValueError(result.error or f"tool '{call.tool_name}' failed")
+        return results
+
+    def _tool_results_message(self, tool_results: list[ToolResult]) -> Message:
+        """Append tool results as model-visible context for the next step."""
+        lines = ["Tool results from the previous assistant request:"]
+        for result in tool_results:
+            if result.success:
+                content = result.content or ""
+                lines.append(f"- {result.tool_name}: success\n{content}")
+            else:
+                lines.append(f"- {result.tool_name}: failed\n{result.error or 'unknown error'}")
+        lines.append("Use these tool results to continue and return the required final JSON when ready.")
+        return Message(role="user", content="\n".join(lines))
 
     def _validation_feedback_message(self, exc: Exception) -> Message:
         """Tell the assistant exactly why another structured response is needed."""

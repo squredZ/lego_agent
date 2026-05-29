@@ -10,6 +10,7 @@ from lego_agent.cli import main
 from lego_agent.core.models import (
     AssistantRequest,
     AssistantResponse,
+    Message,
     Project,
     ProjectStatus,
     Staff,
@@ -20,6 +21,7 @@ from lego_agent.core.models import (
     Task,
     TaskExecutionResult,
     TaskStatus,
+    ToolCall,
     WorkResult,
     WorkContext,
 )
@@ -33,7 +35,7 @@ from lego_agent.project.interaction import (
 )
 from lego_agent.project.runtime import create_project_runtime
 from lego_agent.project.staffing import StaffFactory, StaffProfileResolver, normalize_staff_role_id
-from lego_agent.workflow.managers import NoopMemoryManager, NoopSkillManager, NoopToolManager
+from lego_agent.workflow.managers import BuiltinToolManager, NoopMemoryManager, NoopSkillManager, NoopToolManager
 from lego_agent.workflow.output import ProjectResultOutputParser
 from lego_agent.workflow.staff_workflow import IterativeStaffWorkflow, SinglePassStaffWorkflow
 
@@ -266,6 +268,22 @@ def test_parses_iterative_workflow_config() -> None:
     assert config.workflow.max_output_retries == 1
 
 
+def test_parses_builtin_tool_config() -> None:
+    raw_config = _config()
+    raw_config["workflow"] = {
+        "type": "iterative",
+        "tools": "builtin",
+        "enabled_tools": ["echo"],
+        "workspace_root": "/tmp",
+    }
+
+    config = parse_project_runtime_config(raw_config)
+
+    assert config.workflow.tools == "builtin"
+    assert config.workflow.enabled_tools == ["echo"]
+    assert config.workflow.workspace_root == "/tmp"
+
+
 def test_rejects_invalid_workflow_limits() -> None:
     raw_config = _config()
     raw_config["workflow"] = {"type": "iterative", "max_steps": 0}
@@ -294,6 +312,15 @@ def test_runtime_creates_iterative_workflow_from_config() -> None:
 
     assert isinstance(runtime.workflow, IterativeStaffWorkflow)
     assert runtime.workflow.workflow_config.max_steps == 3
+
+
+def test_runtime_injects_builtin_tool_manager_from_config() -> None:
+    raw_config = _config()
+    raw_config["workflow"] = {"type": "iterative", "tools": "builtin", "enabled_tools": ["echo"]}
+
+    runtime = create_project_runtime(parse_project_runtime_config(raw_config))
+
+    assert isinstance(runtime.workflow.tool_manager, BuiltinToolManager)
 
 
 def test_project_run_records_events() -> None:
@@ -604,6 +631,94 @@ def test_iterative_workflow_retries_invalid_output_and_succeeds() -> None:
     assert "workflow_step_completed" in event_types
 
 
+def test_iterative_workflow_executes_tool_call_and_continues() -> None:
+    class ToolThenFinalAssistant:
+        """Test fake that requests a tool, then returns final structured output."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[list[Message]] = []
+
+        def respond(self, request):
+            self.calls += 1
+            self.messages.append(list(request.messages))
+            if self.calls == 1:
+                return AssistantResponse(
+                    content="",
+                    tool_calls=[ToolCall(id="call_1", tool_name="echo", arguments={"text": "tool output"})],
+                    finish_reason="tool_calls",
+                )
+            assert "tool output" in request.messages[-1].content
+            return AssistantResponse(
+                content=TaskExecutionResult(
+                    summary="Used a tool.",
+                    work_performed=["Called echo."],
+                    deliverables=["Tool-informed output."],
+                    final_output="Final after tool.",
+                ).model_dump_json()
+            )
+
+    project, _manager, worker = _project_with_worker()
+    assistant = ToolThenFinalAssistant()
+    worker.assistant = assistant
+    task = Task(
+        project_id=project.id,
+        title="Use tool",
+        goal="Use echo tool",
+        assigned_to=worker.id,
+        created_by=project.manager_id,
+    )
+    project.tasks[task.id] = task
+    workflow = IterativeStaffWorkflow(tool_manager=BuiltinToolManager(enabled_tools=["echo"]))
+
+    result = workflow.run(project, worker, task)
+
+    assert result.status == TaskStatus.DONE
+    assert result.output == "Final after tool."
+    assert assistant.calls == 2
+    event_types = [event.type for event in project.events]
+    assert "tool_call_requested" in event_types
+    assert "tool_call_completed" in event_types
+
+
+def test_iterative_workflow_fails_when_tool_limit_is_exceeded() -> None:
+    class TooManyToolsAssistant:
+        """Test fake that requests more tools than allowed in one step."""
+
+        def respond(self, request):
+            return AssistantResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="call_1", tool_name="echo", arguments={"text": "one"}),
+                    ToolCall(id="call_2", tool_name="echo", arguments={"text": "two"}),
+                ],
+            )
+
+    project, _manager, worker = _project_with_worker()
+    worker.assistant = TooManyToolsAssistant()
+    task = Task(
+        project_id=project.id,
+        title="Use too many tools",
+        goal="Use too many tools",
+        assigned_to=worker.id,
+        created_by=project.manager_id,
+    )
+    project.tasks[task.id] = task
+    workflow_config = parse_project_runtime_config(
+        {**_config(), "workflow": {"type": "iterative", "max_tool_calls": 1}}
+    ).workflow
+    workflow = IterativeStaffWorkflow(
+        workflow_config=workflow_config,
+        tool_manager=BuiltinToolManager(enabled_tools=["echo"]),
+    )
+
+    result = workflow.run(project, worker, task)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.error is not None
+    assert "max_tool_calls" in result.error.message
+
+
 def test_iterative_workflow_fails_after_output_retry_limit() -> None:
     class AlwaysInvalidAssistant:
         """Test fake that never satisfies the structured output contract."""
@@ -670,6 +785,37 @@ def test_noop_managers_are_safe() -> None:
         task,
         "Plan",
     ) == []
+
+
+def test_builtin_tool_manager_echoes_text() -> None:
+    result = BuiltinToolManager(enabled_tools=["echo"]).call_tool(
+        ToolCall(tool_name="echo", arguments={"text": "hello"})
+    )
+
+    assert result.success is True
+    assert result.content == "hello"
+
+
+def test_builtin_tool_manager_reads_workspace_file(tmp_path) -> None:
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("project notes", encoding="utf-8")
+
+    result = BuiltinToolManager(workspace_root=tmp_path).call_tool(
+        ToolCall(tool_name="read_project_file", arguments={"path": "notes.txt"})
+    )
+
+    assert result.success is True
+    assert result.content == "project notes"
+    assert result.data["path"] == "notes.txt"
+
+
+def test_builtin_tool_manager_blocks_file_outside_workspace(tmp_path) -> None:
+    result = BuiltinToolManager(workspace_root=tmp_path).call_tool(
+        ToolCall(tool_name="read_project_file", arguments={"path": "../outside.txt"})
+    )
+
+    assert result.success is False
+    assert result.error == "path is outside the workspace"
 
 
 def test_project_result_parser_accepts_valid_json() -> None:
@@ -841,6 +987,34 @@ def test_openai_assistant_collects_streaming_chat_completion_content() -> None:
     content = OpenAIAssistant(stream=True)._streaming_chat_completion_content(stream)
 
     assert content == '{"summary": "ok"}'
+
+
+def test_openai_assistant_extracts_chat_completion_tool_calls() -> None:
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="tool_calls",
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call_1",
+                            function=SimpleNamespace(
+                                name="echo",
+                                arguments='{"text": "hello"}',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+    assistant = OpenAIAssistant()
+    tool_calls = assistant._chat_completion_tool_calls(response)
+
+    assert assistant._chat_completion_finish_reason(response) == "tool_calls"
+    assert tool_calls == [ToolCall(id="call_1", tool_name="echo", arguments={"text": "hello"})]
 
 
 def test_openai_assistant_uses_env_api_key_for_live_mode(monkeypatch) -> None:

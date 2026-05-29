@@ -25,6 +25,7 @@ from lego_agent.project.orchestrator import (
     ProjectManagerWithStaffOrchestrator,
 )
 from lego_agent.project.staffing import StaffFactory, StaffProfileResolver
+from lego_agent.workflow.managers import BuiltinToolManager, NoopToolManager
 from lego_agent.workflow.staff_workflow import IterativeStaffWorkflow, SinglePassStaffWorkflow
 
 AssistantFactory = Callable[[dict[str, object]], Assistant]
@@ -235,9 +236,13 @@ class ProjectRuntime:
     def _create_workflow(self) -> SinglePassStaffWorkflow:
         """Create the staff workflow selected by runtime config."""
         workflow_config = self.config.workflow
+        tool_manager = self._create_tool_manager()
         if workflow_config.type == "single_pass":
             logger.debug("created workflow", extra={"workflow_type": workflow_config.type})
-            return SinglePassStaffWorkflow(event_recorder=self.event_recorder)
+            return SinglePassStaffWorkflow(
+                event_recorder=self.event_recorder,
+                tool_manager=tool_manager,
+            )
         if workflow_config.type == "iterative":
             logger.debug(
                 "created workflow",
@@ -250,9 +255,23 @@ class ProjectRuntime:
             return IterativeStaffWorkflow(
                 workflow_config=workflow_config,
                 event_recorder=self.event_recorder,
+                tool_manager=tool_manager,
             )
         logger.error("unsupported workflow type", extra={"workflow_type": workflow_config.type})
         raise ValueError(f"unsupported workflow type: {workflow_config.type}")
+
+    def _create_tool_manager(self):
+        """Create the tool manager selected by workflow config."""
+        workflow_config = self.config.workflow
+        if workflow_config.tools == "noop":
+            return NoopToolManager()
+        if workflow_config.tools == "builtin":
+            return BuiltinToolManager(
+                workspace_root=workflow_config.workspace_root,
+                enabled_tools=workflow_config.enabled_tools,
+            )
+        logger.error("unsupported tool manager", extra={"tools": workflow_config.tools})
+        raise ValueError(f"unsupported workflow tools: {workflow_config.tools}")
 
     def _attach_staff_profile_resolution(self, result: ProjectRunResult) -> None:
         """Attach staffing profile matches after the PM produces a plan."""

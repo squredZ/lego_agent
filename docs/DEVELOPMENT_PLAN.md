@@ -2,8 +2,10 @@
 
 ## Current Status
 
-The project-oriented runtime foundation and the first synchronous multi-staff
-execution slice are implemented.
+The project-oriented runtime foundation, synchronous multi-staff execution
+slice, iterative staff workflow, first tool-call loop, and model package
+refactor are implemented. The Project Console is designed but not yet
+implemented.
 
 Current runtime behavior:
 
@@ -28,10 +30,21 @@ Optional V2B iterative workflow:
 Staff task
   -> IterativeStaffWorkflow
   -> assistant response
+  -> optional assistant-requested tool calls
+  -> ToolManager executes enabled tools
+  -> tool results are appended to runtime messages
   -> strict structured output validation
   -> validation feedback retry when needed
   -> WorkResult
 ```
+
+Current documentation state:
+
+- `docs/PROJECT_AGENT_DESIGN.md` describes the project-oriented runtime and
+  staff workflow design.
+- `docs/CLI_CALL_FLOW.md` explains the CLI startup and runtime call chain.
+- `docs/PROJECT_CONSOLE_DESIGN.md` defines the minimal frontend interaction
+  layer and development plan.
 
 Verified commands:
 
@@ -43,7 +56,7 @@ Verified commands:
 Current test result:
 
 ```text
-41 passed
+49 passed
 ```
 
 ## Version 1 Scope
@@ -172,6 +185,10 @@ Implemented in the `lego_agent/core/models/` package and re-exported from
 Acceptance status:
 
 - Models use Pydantic `BaseModel`.
+- Models are split by concern under `lego_agent/core/models/`.
+- `lego_agent.core.models` remains the stable import path through package
+  re-exports.
+- Core model classes and fields include beginner-friendly descriptions.
 - IDs and timestamps use default factories.
 - Project validates that `manager_id` exists and points to role `project_manager`.
 - Tests cover invalid project manager role.
@@ -382,14 +399,17 @@ Acceptance status:
 
 ### Phase 8: Documentation and Comments
 
-Status: complete for current Version 1 scope.
+Status: complete for current Version 1 scope; ongoing for new Version 2 work.
 
 Implemented:
 
 - README updated for project-first usage.
 - `docs/PROJECT_AGENT_DESIGN.md` updated with Mermaid diagrams.
 - `docs/DEVELOPMENT_PLAN.md` refreshed with current progress.
+- `docs/CLI_CALL_FLOW.md` added for the complete CLI call chain.
+- `docs/PROJECT_CONSOLE_DESIGN.md` added for the frontend interaction layer.
 - Beginner-oriented docstrings and comments added to key modules.
+- Core Pydantic models now have class docstrings and field descriptions.
 
 ### Phase 9: Tighten Version 1 Runtime Quality
 
@@ -444,21 +464,31 @@ These are intentionally not blocking Version 1, but should be addressed soon.
 2. Real model structured output is prompt-based.
    - Dry-run returns valid structured data.
    - Live model output is parsed as JSON with fallback.
-   - Next step should improve structured output reliability through V2B iterative validation retries.
+   - V2B iterative validation retries are implemented.
+   - Provider-native structured output support is still deferred.
 
-3. Workflow/orchestrator/tool/skill/output parser registries are deferred.
+3. Tool execution is implemented but tool registration is still too centralized.
+   - `BuiltinToolManager` currently owns the first built-in tool implementations.
+   - Next step is V2B-3: introduce a `Tool` protocol and `ToolRegistry`.
+
+4. Workflow/orchestrator/skill/output parser registries are deferred.
    - Current code has stable classes but not full registries for every extension point.
 
-4. Event recording is in-memory only.
+5. Event recording is in-memory only.
    - Project and task events are available in the current run result.
    - Persistent event storage is still deferred.
 
-5. No persistent storage.
+6. No persistent storage.
    - Projects and tasks exist only for a single run.
 
-6. No real tool execution or skill runtime.
-   - Noop managers are in place as extension slots.
-   - Tool-call loop is now planned in V2B after output validation retries.
+7. No skill runtime.
+   - Skills are currently selected as workflow/prompt context only.
+   - Real skill execution is planned after tool and iterative workflow semantics stabilize.
+
+8. No frontend runtime implementation yet.
+   - `docs/PROJECT_CONSOLE_DESIGN.md` defines the minimal interaction hub,
+     local HTTP API, and static console direction.
+   - Implementation starts in Version 2E.
 
 ## Next Development Plan
 
@@ -614,7 +644,7 @@ Development sequence:
    - Execute tools through `ToolManager`.
    - Append tool results to runtime messages.
    - Continue until valid final output or failure.
-   Status: pending.
+   Status: done.
 
 Tasks:
 
@@ -632,23 +662,23 @@ Tasks:
 4. Extend `AssistantResponse` with:
    - `tool_calls`
    - `finish_reason`
-   Status: pending.
+   Status: done.
 5. Extend `ToolCall` with provider call id.
-   Status: pending.
+   Status: done.
 6. Parse Chat Completions `message.tool_calls` into framework `ToolCall` objects.
-   Status: pending.
+   Status: done.
 7. Add tool-call loop:
    - execute tool calls through `ToolManager.call_tool`
    - append tool results to runtime messages
    - continue until valid output or failure
-   Status: pending.
+   Status: done.
 8. Add first built-in safe tools:
    - `echo` for deterministic tool-loop tests.
    - `read_project_file` for controlled local project context reads.
    - Implement built-in tools in the Codex style: narrow schemas, explicit
      contracts, `ToolManager`-mediated execution, structured `ToolResult`,
      clear logs/events, secret redaction, and workspace safety boundaries.
-   Status: pending.
+   Status: done.
 9. Add events:
    - `workflow_step_started`
    - `workflow_step_completed`
@@ -657,12 +687,45 @@ Tasks:
    - `tool_call_failed`
    - `output_validation_failed`
    - `workflow_step_limit_reached`
-   Status: partially done. No-tool iterative retry events are implemented;
-   tool-call events remain pending until V2B-2.
+   Status: done for V2B iterative workflow and tool loop.
 10. Keep `TaskStatus` unchanged until a UI/API needs stronger intermediate states.
    Status: pending.
 
-Acceptance:
+V2B-3: Tool Registry Refactor.
+
+Status: pending.
+
+The current V2B-2 implementation keeps the first built-in tools inside
+`BuiltinToolManager` as a minimal working implementation. The next refactor
+should make tools extensible without continuing to grow that class.
+
+Tasks:
+
+1. Add a `Tool` protocol with:
+   - `name`
+   - `description`
+   - `parameters_schema`
+   - `call(arguments) -> ToolResult`
+   Status: pending.
+2. Add `ToolRegistry`.
+   Status: pending.
+3. Extract `EchoTool`.
+   Status: pending.
+4. Extract `ReadProjectFileTool`.
+   Status: pending.
+5. Make `BuiltinToolManager` delegate to `ToolRegistry`.
+   Status: pending.
+6. Keep existing `enabled_tools`, logging, structured `ToolResult`, and workspace safety behavior unchanged.
+   Status: pending.
+
+V2B-3 acceptance:
+
+- adding a built-in tool does not require editing `BuiltinToolManager`;
+- existing tool-loop tests still pass;
+- `echo` and `read_project_file` behavior remains unchanged;
+- workflows still depend only on `ToolManager.call_tool`, not concrete tool classes.
+
+Version 2B acceptance:
 
 - A staff task can recover from invalid structured output by retrying with validation feedback.
 - A staff task can execute at least one assistant-requested tool call and continue the model conversation.

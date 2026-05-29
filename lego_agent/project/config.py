@@ -99,6 +99,9 @@ class WorkflowConfig(BaseModel):
     max_tool_calls: int = Field(default=5, ge=0)
     max_output_retries: int = Field(default=2, ge=0)
     fail_on_tool_error: bool = True
+    tools: str = "noop"
+    enabled_tools: list[str] = Field(default_factory=lambda: ["echo", "read_project_file"])
+    workspace_root: str | None = None
 
 
 class DynamicStaffConfig(BaseModel):
