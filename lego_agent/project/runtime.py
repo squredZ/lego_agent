@@ -20,9 +20,12 @@ from lego_agent.core.registry import Registry, import_path
 from lego_agent.modules.common import capabilities, register_defaults, responsibilities
 from lego_agent.project.config import AssistantConfig, ProjectRuntimeConfig, StaffProfileConfig
 from lego_agent.project.events import EventRecorder
-from lego_agent.project.orchestrator import ProjectManagerOnlyOrchestrator
-from lego_agent.project.staffing import StaffProfileResolver
-from lego_agent.workflow.staff_workflow import SinglePassStaffWorkflow
+from lego_agent.project.orchestrator import (
+    ProjectManagerOnlyOrchestrator,
+    ProjectManagerWithStaffOrchestrator,
+)
+from lego_agent.project.staffing import StaffFactory, StaffProfileResolver
+from lego_agent.workflow.staff_workflow import IterativeStaffWorkflow, SinglePassStaffWorkflow
 
 AssistantFactory = Callable[[dict[str, object]], Assistant]
 
@@ -69,7 +72,7 @@ class ProjectRuntime:
         _load_modules(config.modules)
         self.config = config
         self.event_recorder = event_recorder or EventRecorder()
-        self.workflow = workflow or SinglePassStaffWorkflow(event_recorder=self.event_recorder)
+        self.workflow = workflow or self._create_workflow()
         self.workflow.event_recorder = self.event_recorder
         self.orchestrator = self._create_orchestrator(config.orchestration.strategy)
 
@@ -205,17 +208,51 @@ class ProjectRuntime:
             assistant=assistant,
         )
 
-    def _create_orchestrator(self, strategy: str) -> ProjectManagerOnlyOrchestrator:
+    def _create_orchestrator(self, strategy: str):
         """Resolve orchestration strategy names from config.
 
-        Only `project_manager_only` is intentionally supported in Version 1.
-        More strategies should be added here or through a registry later.
+        `project_manager_only` keeps Version 1 behavior. `project_manager_with_staff`
+        starts Version 2A by creating recruited staff and child tasks from the
+        project manager's staffing plan.
         """
-        if strategy != "project_manager_only":
-            logger.error("unsupported orchestration strategy", extra={"strategy": strategy})
-            raise ValueError(f"unsupported orchestration strategy: {strategy}")
-        logger.debug("created orchestrator", extra={"strategy": strategy})
-        return ProjectManagerOnlyOrchestrator(self.workflow, self.event_recorder)
+        if strategy == "project_manager_only":
+            logger.debug("created orchestrator", extra={"strategy": strategy})
+            return ProjectManagerOnlyOrchestrator(self.workflow, self.event_recorder)
+        if strategy == "project_manager_with_staff":
+            logger.debug("created orchestrator", extra={"strategy": strategy})
+            return ProjectManagerWithStaffOrchestrator(
+                self.workflow,
+                StaffFactory(
+                    self.config.staff_profiles,
+                    self.config.dynamic_staff,
+                    _create_assistant,
+                ),
+                self.event_recorder,
+            )
+        logger.error("unsupported orchestration strategy", extra={"strategy": strategy})
+        raise ValueError(f"unsupported orchestration strategy: {strategy}")
+
+    def _create_workflow(self) -> SinglePassStaffWorkflow:
+        """Create the staff workflow selected by runtime config."""
+        workflow_config = self.config.workflow
+        if workflow_config.type == "single_pass":
+            logger.debug("created workflow", extra={"workflow_type": workflow_config.type})
+            return SinglePassStaffWorkflow(event_recorder=self.event_recorder)
+        if workflow_config.type == "iterative":
+            logger.debug(
+                "created workflow",
+                extra={
+                    "workflow_type": workflow_config.type,
+                    "max_steps": workflow_config.max_steps,
+                    "max_output_retries": workflow_config.max_output_retries,
+                },
+            )
+            return IterativeStaffWorkflow(
+                workflow_config=workflow_config,
+                event_recorder=self.event_recorder,
+            )
+        logger.error("unsupported workflow type", extra={"workflow_type": workflow_config.type})
+        raise ValueError(f"unsupported workflow type: {workflow_config.type}")
 
     def _attach_staff_profile_resolution(self, result: ProjectRunResult) -> None:
         """Attach staffing profile matches after the PM produces a plan."""

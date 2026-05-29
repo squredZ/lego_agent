@@ -11,6 +11,7 @@ from lego_agent.core.models import (
     ProjectResult,
     StaffRolePlan,
     StaffingPlan,
+    TaskExecutionResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,11 +235,17 @@ class OpenAIAssistant:
         )
 
     def _dry_run_response(self, request: AssistantRequest) -> AssistantResponse:
-        """Build a valid ProjectResult without calling a remote model.
+        """Build a valid structured response without calling a remote model.
 
         Dry-run keeps local tests and examples deterministic. It also documents
-        the structured output the real project manager prompt should produce.
+        the structured output each built-in workflow contract should produce.
         """
+        if request.output_contract and request.output_contract.name == "TaskExecutionResult":
+            return self._dry_run_task_execution_response(request)
+        return self._dry_run_project_result_response(request)
+
+    def _dry_run_project_result_response(self, request: AssistantRequest) -> AssistantResponse:
+        """Build a valid ProjectResult for project manager planning."""
         staff = request.staff
         project = request.project
         task = request.task
@@ -285,4 +292,28 @@ class OpenAIAssistant:
         return AssistantResponse(
             content=project_result.model_dump_json(),
             structured=project_result.model_dump(mode="json"),
+        )
+
+    def _dry_run_task_execution_response(self, request: AssistantRequest) -> AssistantResponse:
+        """Build a valid TaskExecutionResult for recruited staff tasks."""
+        task_result = TaskExecutionResult(
+            summary=f"{request.staff.name} completed the assigned task.",
+            work_performed=[f"Handled task goal: {request.task.goal}"],
+            deliverables=[f"Draft deliverable for {request.task.title}"],
+            blockers=[],
+            next_steps=["Wait for project manager review."],
+            final_output=f"[dry-run:{self.model}] {request.staff.role} handled '{request.task.goal}'.",
+        )
+        logger.debug(
+            "assistant dry-run task response built",
+            extra={
+                "project_id": request.project.id,
+                "staff_id": request.staff.id,
+                "task_id": request.task.id,
+                "model": self.model,
+            },
+        )
+        return AssistantResponse(
+            content=task_result.model_dump_json(),
+            structured=task_result.model_dump(mode="json"),
         )

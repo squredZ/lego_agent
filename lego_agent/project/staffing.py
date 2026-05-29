@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 
 from lego_agent.core.models import (
@@ -17,6 +18,18 @@ from lego_agent.modules.common import capabilities, responsibilities
 from lego_agent.project.config import AssistantConfig, DynamicStaffConfig, StaffProfileConfig
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_staff_role_id(raw_role: str) -> str:
+    """Convert model-generated role text into a stable internal identifier.
+
+    LLMs often return human labels such as "Frontend Developer". Runtime state,
+    task assignment, messages, and future persistence need a predictable id, so
+    dynamic roles are normalized to lowercase snake_case while display titles
+    keep the original human-readable text.
+    """
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", raw_role.strip().lower()).strip("_")
+    return normalized or "staff"
 
 
 class StaffProfileResolver:
@@ -93,10 +106,13 @@ class StaffProfileResolver:
         )
 
     def _profile_name_for_role(self, planned_role: str) -> str | None:
+        normalized_role = normalize_staff_role_id(planned_role)
         if planned_role in self.profiles:
             return planned_role
+        if normalized_role in self.profiles:
+            return normalized_role
         for profile_name, profile in self.profiles.items():
-            if profile.role == planned_role:
+            if profile.role == planned_role or normalize_staff_role_id(profile.role) == normalized_role:
                 return profile_name
         return None
 
@@ -158,16 +174,22 @@ class StaffFactory:
     ) -> Staff:
         if not self.dynamic_staff.enabled:
             raise ValueError(f"dynamic staff creation is disabled for role '{role_plan.role}'")
+        staff_id = normalize_staff_role_id(role_plan.role)
         logger.info(
             "creating staff dynamically from staffing plan",
-            extra={"project_id": project_id, "staff_id": role_plan.role},
+            extra={
+                "project_id": project_id,
+                "staff_id": staff_id,
+                "planned_role": role_plan.role,
+            },
         )
         return Staff(
-            id=role_plan.role,
+            id=staff_id,
             project_id=project_id,
             name=role_plan.title,
-            role=role_plan.role,
+            role=staff_id,
             title=role_plan.title,
+            metadata={"planned_role": role_plan.role},
             responsibilities=[
                 self._responsibility_from_plan(name)
                 for name in role_plan.responsibilities
@@ -181,10 +203,13 @@ class StaffFactory:
         )
 
     def _profile_for_role(self, role: str) -> StaffProfileConfig | None:
+        normalized_role = normalize_staff_role_id(role)
         if role in self.profiles:
             return self.profiles[role]
+        if normalized_role in self.profiles:
+            return self.profiles[normalized_role]
         for profile in self.profiles.values():
-            if profile.role == role:
+            if profile.role == role or normalize_staff_role_id(profile.role) == normalized_role:
                 return profile
         return None
 

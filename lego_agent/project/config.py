@@ -91,6 +91,16 @@ class OrchestrationConfig(BaseModel):
     strategy: str = "project_manager_only"
 
 
+class WorkflowConfig(BaseModel):
+    """Selects how each staff member executes an assigned task."""
+
+    type: str = "single_pass"
+    max_steps: int = Field(default=8, ge=1)
+    max_tool_calls: int = Field(default=5, ge=0)
+    max_output_retries: int = Field(default=2, ge=0)
+    fail_on_tool_error: bool = True
+
+
 class DynamicStaffConfig(BaseModel):
     """Controls staff created from project-manager staffing plans."""
 
@@ -105,6 +115,7 @@ class ProjectRuntimeConfig(BaseModel):
 
     project: ProjectDefaultsConfig = Field(default_factory=ProjectDefaultsConfig)
     orchestration: OrchestrationConfig = Field(default_factory=OrchestrationConfig)
+    workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
     staff_profiles: dict[str, StaffProfileConfig]
     dynamic_staff: DynamicStaffConfig = Field(default_factory=DynamicStaffConfig)
     modules: list[str] = Field(default_factory=list)

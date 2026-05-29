@@ -2,7 +2,8 @@
 
 ## Current Status
 
-The first project-oriented runtime slice is implemented.
+The project-oriented runtime foundation and the first synchronous multi-staff
+execution slice are implemented.
 
 Current runtime behavior:
 
@@ -14,7 +15,22 @@ project goal
   -> project manager planning Task
   -> SinglePassStaffWorkflow
   -> ProjectResult with staffing_plan
+  -> create recruited Staff from staffing_plan
+  -> create and dispatch child Tasks
+  -> execute child Tasks through SinglePassStaffWorkflow
+  -> TaskExecutionResult for each child Task
   -> ProjectRunResult
+```
+
+Optional V2B iterative workflow:
+
+```text
+Staff task
+  -> IterativeStaffWorkflow
+  -> assistant response
+  -> strict structured output validation
+  -> validation feedback retry when needed
+  -> WorkResult
 ```
 
 Verified commands:
@@ -27,7 +43,7 @@ Verified commands:
 Current test result:
 
 ```text
-19 passed
+41 passed
 ```
 
 ## Version 1 Scope
@@ -126,7 +142,8 @@ Acceptance status:
 
 Status: complete.
 
-Implemented in `lego_agent/core/models.py`:
+Implemented in the `lego_agent/core/models/` package and re-exported from
+`lego_agent.core.models` for compatibility:
 
 - `Project`
 - `ProjectStatus`
@@ -427,7 +444,7 @@ These are intentionally not blocking Version 1, but should be addressed soon.
 2. Real model structured output is prompt-based.
    - Dry-run returns valid structured data.
    - Live model output is parsed as JSON with fallback.
-   - Next step should improve structured output reliability.
+   - Next step should improve structured output reliability through V2B iterative validation retries.
 
 3. Workflow/orchestrator/tool/skill/output parser registries are deferred.
    - Current code has stable classes but not full registries for every extension point.
@@ -441,6 +458,7 @@ These are intentionally not blocking Version 1, but should be addressed soon.
 
 6. No real tool execution or skill runtime.
    - Noop managers are in place as extension slots.
+   - Tool-call loop is now planned in V2B after output validation retries.
 
 ## Next Development Plan
 
@@ -489,11 +507,13 @@ Tasks:
 5. Add CLI option to print planned staff profile matches: done.
 6. Add `DynamicStaffConfig`: done.
 7. Add `StaffFactory` for profile-template or dynamic staff creation: done.
+8. Normalize model-generated dynamic staff roles to stable snake_case ids: done.
 
 Acceptance:
 
 - PM staffing plan can be matched against configured profiles when profiles exist.
 - Missing profile cases are treated as dynamic staff when dynamic staff is enabled.
+- Human role labels such as `Frontend Developer` become stable internal ids such as `frontend_developer`.
 - Human CLI output can show planned role/profile matches with `--staffing-matches`.
 
 ## Version 2 Plan: Dynamic Staff Creation and Execution
@@ -523,9 +543,9 @@ Configured staff profiles are reusable templates, not a whitelist.
 
 ### Version 2A: Synchronous Multi-Staff Semantics
 
-Status: in progress. Foundation models and in-memory collaboration components
-are implemented; orchestration that creates and runs recruited staff is still
-pending.
+Status: in progress. Foundation models, in-memory collaboration components,
+staffing bootstrap, and synchronous worker execution are implemented. Manager
+review is still pending.
 
 Objective: model multi-staff collaboration without real concurrency.
 
@@ -549,16 +569,16 @@ Tasks:
    - `TaskCompletionHandler`
    Status: done.
 5. Runtime maps `StaffRolePlan` to profile templates or dynamic staff creation.
-   Status: foundation done through `StaffProfileResolver`, `DynamicStaffConfig`, and `StaffFactory`;
-   orchestration integration pending.
+   Status: done for `project_manager_with_staff` bootstrap.
 6. Runtime creates recruited staff inside the project.
-   Status: foundation done through `StaffFactory`; orchestration integration pending.
+   Status: done for `project_manager_with_staff` bootstrap.
 7. Runtime creates child tasks assigned to recruited staff.
-   Status: pending.
+   Status: done for `project_manager_with_staff` bootstrap.
 8. Staff execute child tasks one by one through `SinglePassStaffWorkflow`.
-   Status: pending.
+   Status: done. Non-manager staff now use the `TaskExecutionResult` output
+   contract while the project manager keeps using `ProjectResult`.
 9. Child task completion updates task state, emits task events, and sends manager inbox messages.
-   Status: foundation done through `TaskCompletionHandler`; orchestration integration pending.
+   Status: done for synchronous `project_manager_with_staff` execution.
 10. Manager reviews after all child tasks complete.
    Status: pending.
 
@@ -566,6 +586,7 @@ Acceptance:
 
 - A project can create at least two recruited staff from profile templates or dynamic role plans.
 - Recruited staff receive child tasks.
+- Recruited staff execute child tasks synchronously in Version 2A.
 - Each child task completion creates:
   - updated task state
   - task event
@@ -573,7 +594,84 @@ Acceptance:
 - Manager final review uses task state as source of truth.
 - Existing PM-only mode remains supported.
 
-### Version 2B: Asyncio Concurrent Staff Execution
+### Version 2B: Iterative Staff Workflow
+
+Objective: make one staff task capable of realistic multi-round execution before
+adding concurrency. `SinglePassStaffWorkflow` remains the simple baseline;
+`IterativeStaffWorkflow` should share the same `run(project, staff, task) ->
+WorkResult` interface so orchestrators do not depend on workflow internals.
+
+Development sequence:
+
+1. V2B-1: no-tool iterative workflow.
+   - Add workflow configuration.
+   - Add multi-step loop control.
+   - Retry when structured output validation fails.
+   - Stop clearly when step or retry limits are reached.
+   Status: done.
+2. V2B-2: real tool loop.
+   - Parse assistant-requested tool calls.
+   - Execute tools through `ToolManager`.
+   - Append tool results to runtime messages.
+   - Continue until valid final output or failure.
+   Status: pending.
+
+Tasks:
+
+1. Add `WorkflowConfig`:
+   - `type`
+   - `max_steps`
+   - `max_tool_calls`
+   - `max_output_retries`
+   - `fail_on_tool_error`
+   Status: done.
+2. Add workflow construction from runtime config.
+   Status: done.
+3. Add `IterativeStaffWorkflow` with no-tool multi-step output validation retries.
+   Status: done.
+4. Extend `AssistantResponse` with:
+   - `tool_calls`
+   - `finish_reason`
+   Status: pending.
+5. Extend `ToolCall` with provider call id.
+   Status: pending.
+6. Parse Chat Completions `message.tool_calls` into framework `ToolCall` objects.
+   Status: pending.
+7. Add tool-call loop:
+   - execute tool calls through `ToolManager.call_tool`
+   - append tool results to runtime messages
+   - continue until valid output or failure
+   Status: pending.
+8. Add first built-in safe tools:
+   - `echo` for deterministic tool-loop tests.
+   - `read_project_file` for controlled local project context reads.
+   - Implement built-in tools in the Codex style: narrow schemas, explicit
+     contracts, `ToolManager`-mediated execution, structured `ToolResult`,
+     clear logs/events, secret redaction, and workspace safety boundaries.
+   Status: pending.
+9. Add events:
+   - `workflow_step_started`
+   - `workflow_step_completed`
+   - `tool_call_requested`
+   - `tool_call_completed`
+   - `tool_call_failed`
+   - `output_validation_failed`
+   - `workflow_step_limit_reached`
+   Status: partially done. No-tool iterative retry events are implemented;
+   tool-call events remain pending until V2B-2.
+10. Keep `TaskStatus` unchanged until a UI/API needs stronger intermediate states.
+   Status: pending.
+
+Acceptance:
+
+- A staff task can recover from invalid structured output by retrying with validation feedback.
+- A staff task can execute at least one assistant-requested tool call and continue the model conversation.
+- Tool execution is observable through events and does not bypass `ToolManager`.
+- Step limits and tool-call limits produce clear task failure events.
+- Existing `SinglePassStaffWorkflow` and PM-only mode remain supported.
+- Orchestrators can switch workflow implementation through config without direct code changes.
+
+### Version 2C: Asyncio Concurrent Staff Execution
 
 Objective: make staff task execution concurrent while keeping the same state/message abstractions.
 
@@ -591,7 +689,7 @@ Acceptance:
 - Failed child tasks are visible to manager and project state.
 - Manager review waits for completion criteria rather than direct staff calls.
 
-### Version 2C: Distributed Execution Readiness
+### Version 2D: Distributed Execution Readiness
 
 Objective: prepare the same interaction model for external workers.
 
@@ -607,13 +705,41 @@ Acceptance:
 - In-memory implementation can be replaced without changing workflow logic.
 - Task/event/message models are safe to persist.
 
+### Version 2E: Project Console and User Interaction
+
+Status: pending.
+
+Detailed design:
+
+```text
+docs/PROJECT_CONSOLE_DESIGN.md
+```
+
+Objective: add a minimal frontend interaction layer without making workflows or
+orchestrators depend on UI code.
+
+Planned phases:
+
+1. Add `ProjectInteractionHub`.
+2. Let `EventRecorder` optionally publish events and snapshots to the hub.
+3. Add a local HTTP API.
+4. Add a static web console.
+5. Later, let runtime consume selected user commands and feedback.
+
+Acceptance:
+
+- user can see project status, staff, tasks, and event stream;
+- user can submit feedback into the interaction hub;
+- core runtime remains usable from CLI without the console;
+- frontend never directly mutates workflow or orchestrator internals.
+
 ### Original Version 2 Capabilities
 
 1. Project manager creates a structured `StaffingPlan`.
 2. Runtime maps `StaffRolePlan` to `StaffProfileConfig`.
 3. Runtime creates recruited staff inside the project.
 4. Project manager creates tasks for recruited staff.
-5. Staff execute tasks through the same `SinglePassStaffWorkflow`.
+5. Staff execute tasks through the same workflow interface.
 6. Project manager reviews staff outputs.
 7. Project manager produces final `ProjectResult`.
 
@@ -628,9 +754,19 @@ Manager awareness must come from:
 
 Version 3 should deepen agent capabilities after multi-staff execution is stable.
 
+Skill runtime starts in Version 3, not V2B. V2B should keep skills as selected
+prompt instructions while tool execution and iterative workflow semantics
+stabilize. A later skill runtime can then be designed as a reusable process
+that may bundle prompt instructions, allowed tools, validation rules, and
+possibly nested workflow behavior.
+
+Built-in skills should reference Codex skill design principles: a skill is a
+reusable method with instructions, capability requirements, allowed tools, and
+validation expectations. It should not be modeled as a raw callable tool unless
+it performs one concrete external action.
+
 Candidates:
 
-- Real tool calling loop
 - Skill runtime execution
 - Persistent project/task/event store
 - Project memory retrieval

@@ -142,6 +142,7 @@ graph TD
     StaffingPlan[StaffingPlan]
     StaffRolePlan[StaffRolePlan]
     ProjectResult[ProjectResult]
+    TaskExecutionResult[TaskExecutionResult]
 
     Project -->|primary manager| Staff
     Project -->|project members| Staff
@@ -151,6 +152,7 @@ graph TD
     Staff -->|assigned| Task
     ProjectResult -->|includes| StaffingPlan
     StaffingPlan -->|requires| StaffRolePlan
+    Task -->|worker output| TaskExecutionResult
 ```
 
 ### 4.2 ProjectStatus
@@ -307,6 +309,12 @@ class StaffRolePlan(BaseModel):
     priority: int = 1
 ```
 
+`StaffRolePlan.role` is model-generated text, so it may be a human label such
+as `"Frontend Developer"`. When the runtime creates dynamic staff, it normalizes
+that role into a stable internal staff id and role such as
+`"frontend_developer"`. The original human label is preserved in `title` and in
+staff metadata as `planned_role`.
+
 ### 4.8.1 StaffProfileResolution
 
 Version 1 does not create recruited staff yet, but it resolves each planned role
@@ -354,7 +362,23 @@ class ProjectResult(BaseModel):
     final_output: str
 ```
 
-### 4.10 ProjectRunResult
+### 4.10 TaskExecutionResult
+
+`TaskExecutionResult` is the structured output produced by non-manager staff for
+one assigned task. It keeps worker output separate from the project manager's
+project-level `ProjectResult`.
+
+```python
+class TaskExecutionResult(BaseModel):
+    summary: str
+    work_performed: list[str] = []
+    deliverables: list[str] = []
+    blockers: list[str] = []
+    next_steps: list[str] = []
+    final_output: str
+```
+
+### 4.11 ProjectRunResult
 
 `ProjectRunResult` is returned by CLI/API execution.
 
@@ -378,7 +402,7 @@ class ProjectRunResult(BaseModel):
     duration_ms: int | None = None
 ```
 
-### 4.11 ProjectEvent and TaskEvent
+### 4.12 ProjectEvent and TaskEvent
 
 Events provide lightweight in-memory observability for Version 1.
 
@@ -461,6 +485,8 @@ class AssistantRequest(BaseModel):
 ```python
 class AssistantResponse(BaseModel):
     content: str
+    tool_calls: list[ToolCall] = []
+    finish_reason: str | None = None
     structured: dict[str, Any] = {}
     raw: Any | None = None
     metadata: dict[str, Any] = {}
@@ -487,6 +513,7 @@ class ToolSpec(BaseModel):
 
 ```python
 class ToolCall(BaseModel):
+    id: str | None = None
     tool_name: str
     arguments: dict[str, Any] = {}
 ```
@@ -500,7 +527,10 @@ class ToolResult(BaseModel):
     data: dict[str, Any] = {}
 ```
 
-Version 1 defines tool interfaces and a noop implementation. It does not execute model-requested tool calls.
+Version 1 defines tool interfaces and a noop implementation. V2B introduces
+the workflow loop that can execute model-requested tool calls, append tool
+results back to the running message history, and continue until the task
+produces valid final output or fails.
 
 ### 4.15 Skills
 
@@ -642,7 +672,8 @@ receive_task
   -> report_result
 ```
 
-Version 1 uses this workflow only for the project manager.
+Version 1 used this workflow only for the project manager. V2A also uses it
+for recruited staff, with a different output contract for worker tasks.
 
 The project manager task is:
 
@@ -667,7 +698,7 @@ class StaffWorkflow:
     def report_result(...): ...
 ```
 
-Version 1 should provide:
+Current implemented workflow components:
 
 - `SinglePassStaffWorkflow`
 - `DefaultContextManager`
@@ -676,8 +707,24 @@ Version 1 should provide:
 - `NoopSkillManager`
 - `DefaultPromptBuilder`
 - `ProjectResultOutputParser`
+- `TaskExecutionResultOutputParser`
 
 The project manager should not use a separate workflow class. It uses the same workflow with a project-manager output contract.
+
+For realistic tasks, `SinglePassStaffWorkflow` is not enough. It is retained as
+the simple baseline, while V2B should add `IterativeStaffWorkflow` with the same
+public `run(project, staff, task) -> WorkResult` shape. Orchestrators should
+depend on the workflow interface, not on whether the workflow is single-pass or
+iterative.
+
+```python
+class WorkflowConfig(BaseModel):
+    type: str = "single_pass"
+    max_steps: int = 8
+    max_tool_calls: int = 5
+    max_output_retries: int = 2
+    fail_on_tool_error: bool = True
+```
 
 ### 6.1 StaffWorkflow State Flow
 
@@ -721,6 +768,75 @@ graph TD
     Report --> WorkResult[WorkResult]
 ```
 
+### 6.3 Iterative Staff Workflow
+
+`IterativeStaffWorkflow` is the target workflow for real agent execution. One
+task may require multiple assistant calls, tool calls, output validation
+feedback, and retries before it can be completed.
+
+```text
+receive_task
+  -> build_context
+  -> retrieve_memory
+  -> select_skills
+  -> select_tools
+  -> build initial messages
+  -> while step_count < max_steps:
+       execute_work
+       if assistant returned tool_calls:
+         execute_tool_calls
+         append tool results to messages
+         continue
+       parse_output
+       if output is valid:
+         update_memory
+         report_result
+         break
+       if output is invalid and retries remain:
+         append validation feedback to messages
+         continue
+       fail task
+```
+
+```mermaid
+graph TD
+    Start([Start]) --> BuildInitial[Build Context Skills Tools Messages]
+    BuildInitial --> CallAssistant[Call Assistant]
+    CallAssistant --> HasTools{Tool calls?}
+    HasTools -->|yes| ExecuteTools[Execute Tool Calls]
+    ExecuteTools --> AppendTools[Append Tool Results]
+    AppendTools --> StepLimit{Step limit reached?}
+    StepLimit -->|no| CallAssistant
+    StepLimit -->|yes| Failed[Task FAILED]
+
+    HasTools -->|no| ParseOutput[Parse Structured Output]
+    ParseOutput --> Valid{Valid output?}
+    Valid -->|yes| Done[Task DONE]
+    Valid -->|no retries remain| Failed
+    Valid -->|retry remains| Feedback[Append Validation Feedback]
+    Feedback --> StepLimit
+```
+
+V2B should first implement multi-step output validation retries without real
+tool execution. The second increment should add the tool-call loop. This keeps
+the workflow change reviewable and avoids changing assistant parsing, tool
+execution, and output validation all at once.
+
+Intermediate task progress should be represented by events before expanding
+`TaskStatus`. Initial V2B events should include:
+
+- `workflow_step_started`
+- `workflow_step_completed`
+- `tool_call_requested`
+- `tool_call_completed`
+- `tool_call_failed`
+- `output_validation_failed`
+- `workflow_step_limit_reached`
+
+`TaskStatus` can remain `pending`, `in_progress`, `done`, and `failed` until a
+UI/API needs stronger states such as `waiting_tool`, `waiting_manager`, or
+`blocked`.
+
 ## 7. Context, Tools, Skills, and Memory Interfaces
 
 ### 7.1 ContextManager
@@ -751,6 +867,23 @@ class ToolManager:
 
 Version 1 implements `NoopToolManager`. It may list configured tool specs, but does not execute assistant-requested tool calls.
 
+Built-in tool implementation should follow the same practical shape as Codex
+tools:
+
+- each tool has a small explicit schema, a narrow responsibility, and stable
+  input/output contracts;
+- tool execution is mediated by `ToolManager`, never called directly from staff
+  or assistant adapters;
+- tools return structured `ToolResult` objects instead of raising raw provider
+  or operating-system details into workflow code;
+- tools must be observable through events and logs;
+- tools must avoid leaking secrets in logs or model-visible output;
+- tools that can read or change local state must enforce workspace boundaries
+  and clear safety rules.
+
+This keeps tools composable while still allowing future adapters for file,
+shell, web, search, or external API actions.
+
 ### 7.3 SkillManager
 
 ```python
@@ -768,6 +901,20 @@ class SkillManager:
 ```
 
 Version 1 implements `NoopSkillManager` or a simple configured-skill selector.
+
+Built-in skill implementation should also borrow from the Codex model, but at a
+higher abstraction level. A skill should be a reusable work method rather than a
+direct action. In early versions, skills remain prompt instructions selected by
+`SkillManager`. When V3 adds skill runtime, a skill may bundle:
+
+- instructions and examples;
+- required capabilities;
+- allowed tools;
+- validation rules;
+- optional workflow policy such as max steps or retry behavior.
+
+Tools are callable actions. Skills are reusable procedures that guide how a
+staff member uses context, tools, and output contracts.
 
 ### 7.4 MemoryManager
 
@@ -1076,7 +1223,7 @@ sequenceDiagram
 
 Do not start with distributed async execution.
 
-Version 2 should progress in three steps:
+Version 2 should progress in four steps:
 
 1. Synchronous multi-staff with event/message semantics.
    - Create recruited staff.
@@ -1085,17 +1232,57 @@ Version 2 should progress in three steps:
    - Emit events and manager messages.
    - Manager reviews after all child tasks complete.
 
-2. `asyncio` concurrent staff tasks.
+2. Iterative staff workflow.
+   - Keep the same workflow interface.
+   - Add configurable `max_steps`, output retries, and tool-call limits.
+   - Start with output validation retries.
+   - Add real tool-call loops after assistant/tool response contracts are stable.
+
+3. `asyncio` concurrent staff tasks.
    - Use the same stores and buses.
    - Replace sequential execution with concurrent task execution.
 
-3. Distributed execution.
+4. Distributed execution.
    - Replace in-memory stores/buses with Redis, database-backed queues, or workers.
 
 The source of truth remains task state. Events and messages are notifications,
 not the final authority.
 
-### 11.2 Project Manager Only Orchestration
+### 11.2 Project Manager With Staff Execution
+
+`project_manager_with_staff` starts Version 2A with synchronous worker
+execution. It still does not perform manager final review; when child tasks
+finish successfully, the project moves to `reviewing`.
+
+Current behavior:
+
+1. Create project and primary project manager.
+2. Run the project manager through `SinglePassStaffWorkflow`.
+3. Read `ProjectResult.staffing_plan`.
+4. Create recruited staff through `StaffFactory`.
+5. Create one child task for each recruited staff role.
+6. Assign child tasks through `TaskDispatcher`.
+7. Execute each child task through `SinglePassStaffWorkflow`.
+8. Parse worker output as `TaskExecutionResult`.
+9. Complete each task through `TaskCompletionHandler`.
+10. Stop with project status `reviewing`.
+
+```mermaid
+graph TD
+    Goal[Project Goal] --> CreateProject[Create Project]
+    CreateProject --> CreatePM[Create Project Manager Staff]
+    CreatePM --> RunPM[Run PM StaffWorkflow]
+    RunPM --> StaffingPlan[Read StaffingPlan]
+    StaffingPlan --> StaffFactory[Create Recruited Staff]
+    StaffFactory --> ChildTasks[Create Child Tasks]
+    ChildTasks --> Dispatch[Dispatch Tasks]
+    Dispatch --> RunWorkers[Run Worker StaffWorkflow]
+    RunWorkers --> TaskResult[Parse TaskExecutionResult]
+    TaskResult --> CompleteTasks[Complete Tasks And Notify Manager]
+    CompleteTasks --> Reviewing[Project status REVIEWING]
+```
+
+### 11.3 Project Manager Only Orchestration
 
 ```mermaid
 graph TD
@@ -1111,18 +1298,22 @@ graph TD
     Failed --> RunResult
 ```
 
-### 11.3 Version Evolution
+### 11.4 Version Evolution
 
 ```mermaid
 graph LR
     V1[V1 project_manager_only] --> V2[V2 project_manager_with_staff]
-    V2 --> V3[V3 persistent memory and tool execution]
+    V2 --> V2B[V2B iterative staff workflow]
+    V2B --> V2C[V2C async staff execution]
+    V2C --> V2D[V2D distributed staff workers]
+    V2D --> V3[V3 persistent memory and advanced tools]
 
     V1 --> V1A[PM outputs staffing_plan]
     V2 --> V2A[Runtime creates recruited staff]
-    V2 --> V2B[PM delegates tasks]
-    V2 --> V2C[Staff execute same workflow]
-    V3 --> V3A[Multi-round tool calling]
+    V2 --> V2A2[PM delegates tasks]
+    V2 --> V2A3[Staff execute same workflow]
+    V2B --> V2B1[Output validation retries]
+    V2B --> V2B2[Tool-call loop]
     V3 --> V3B[Long-term memory retrieval]
 ```
 

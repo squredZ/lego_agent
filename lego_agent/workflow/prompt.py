@@ -93,7 +93,7 @@ class DefaultPromptBuilder:
             f"Capabilities:\n{capabilities}\n\n"
             "Follow the unified StaffWorkflow. Stay within your responsibilities "
             "and use your capabilities to complete the assigned task. Return only "
-            "one valid JSON object matching the requested project result contract. "
+            "one valid JSON object matching the requested output contract. "
             "Do not wrap the JSON in Markdown. Do not include explanations before "
             "or after the JSON object."
         )
@@ -114,7 +114,7 @@ class DefaultPromptBuilder:
                 "required_roles and rationale."
             )
         schema_json = json.dumps(
-            self._compact_project_result_schema(output_contract.json_schema),
+            self._compact_output_schema(output_contract),
             indent=2,
             sort_keys=True,
         )
@@ -125,17 +125,37 @@ class DefaultPromptBuilder:
                 "schema_chars": len(schema_json),
             },
         )
+        limit_text = (
+            "Keep the output concise: use at most 3 assumptions, 3 risks, "
+            "3 required roles, 5 task breakdown items, and 5 execution plan items. "
+            if output_contract.name == "ProjectResult"
+            else "Keep the output concise: use at most 5 items in any list. "
+        )
         return (
             f"Output contract: {output_contract.name}\n"
             f"{output_contract.instructions}\n\n"
             "Return exactly one JSON object. Do not use Markdown fences. "
             "Do not include comments or prose outside the JSON. "
-            "Keep the output concise: use at most 3 assumptions, 3 risks, "
-            "3 required roles, 5 task breakdown items, and 5 execution plan items. "
+            f"{limit_text}"
             "Keep each string under 120 characters where practical. "
             "Use this compact JSON shape:\n"
             f"{schema_json}"
         )
+
+    def _compact_output_schema(self, output_contract: OutputContract) -> dict[str, Any]:
+        """Use compact hand-authored shapes for framework-owned contracts."""
+        if output_contract.name == "ProjectResult":
+            return self._compact_project_result_schema(output_contract.json_schema)
+        if output_contract.name == "TaskExecutionResult":
+            return {
+                "summary": "string",
+                "work_performed": ["string"],
+                "deliverables": ["string"],
+                "blockers": ["string"],
+                "next_steps": ["string"],
+                "final_output": "string",
+            }
+        return output_contract.json_schema
 
     def _compact_project_result_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
         """Keep prompts short while preserving the output contract.

@@ -6,6 +6,7 @@ from lego_agent.core.models import (
     AssistantRequest,
     EventLevel,
     MemoryItem,
+    Message,
     OutputContract,
     Project,
     ProjectResult,
@@ -14,11 +15,13 @@ from lego_agent.core.models import (
     StaffStatus,
     Task,
     TaskError,
+    TaskExecutionResult,
     TaskStatus,
     ToolSpec,
     WorkContext,
     WorkResult,
 )
+from lego_agent.project.config import WorkflowConfig
 from lego_agent.project.events import EventRecorder
 from lego_agent.workflow.managers import (
     DefaultContextManager,
@@ -26,7 +29,7 @@ from lego_agent.workflow.managers import (
     NoopSkillManager,
     NoopToolManager,
 )
-from lego_agent.workflow.output import ProjectResultOutputParser
+from lego_agent.workflow.output import ProjectResultOutputParser, TaskExecutionResultOutputParser
 from lego_agent.workflow.prompt import DefaultPromptBuilder
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,7 @@ class SinglePassStaffWorkflow:
         tool_manager: NoopToolManager | None = None,
         prompt_builder: DefaultPromptBuilder | None = None,
         output_parser: ProjectResultOutputParser | None = None,
+        task_output_parser: TaskExecutionResultOutputParser | None = None,
         event_recorder: EventRecorder | None = None,
     ) -> None:
         self.context_manager = context_manager or DefaultContextManager()
@@ -56,6 +60,7 @@ class SinglePassStaffWorkflow:
         self.tool_manager = tool_manager or NoopToolManager()
         self.prompt_builder = prompt_builder or DefaultPromptBuilder()
         self.output_parser = output_parser or ProjectResultOutputParser()
+        self.task_output_parser = task_output_parser or TaskExecutionResultOutputParser()
         self.event_recorder = event_recorder or EventRecorder()
         # Test/debug aid: records which workflow hooks ran and in what order.
         self.hook_calls: list[str] = []
@@ -86,9 +91,10 @@ class SinglePassStaffWorkflow:
             tools = self.select_tools(project, staff, task)
             request = self.plan_work(project, staff, task, context, skills, tools, memories)
             response = self.execute_work(staff, request)
-            project_result = self.parse_output(response.content, project)
-            self.update_memory(project, staff, project_result.final_output)
-            result = self.report_result(staff, task, project_result.final_output, project_result)
+            parsed_output = self.parse_output(response.content, project, staff, task)
+            final_output = self._final_output(parsed_output)
+            self.update_memory(project, staff, task, final_output)
+            result = self.report_result(staff, task, final_output, parsed_output)
             self.event_recorder.project_event(
                 project,
                 "workflow_completed",
@@ -296,7 +302,7 @@ class SinglePassStaffWorkflow:
             task_id=task.id,
             data={"hook": "plan_work"},
         )
-        output_contract = self._project_result_contract()
+        output_contract = self._output_contract_for(staff)
         messages = self.prompt_builder.build_messages(
             project,
             staff,
@@ -328,8 +334,14 @@ class SinglePassStaffWorkflow:
         )
         return request
 
+    def _output_contract_for(self, staff: Staff) -> OutputContract:
+        """Select the structured output contract for the current staff role."""
+        if staff.role == "project_manager":
+            return self._project_result_contract()
+        return self._task_execution_result_contract()
+
     def _project_result_contract(self) -> OutputContract:
-        """Build the schema contract expected from the project manager output."""
+        """Build the schema contract expected from project manager output."""
         return OutputContract(
             name="ProjectResult",
             json_schema=ProjectResult.model_json_schema(),
@@ -337,6 +349,18 @@ class SinglePassStaffWorkflow:
                 "Produce the project manager's structured output. "
                 "The staffing_plan must describe roles needed later; do not claim "
                 "those staff have already executed work in Version 1."
+            ),
+        )
+
+    def _task_execution_result_contract(self) -> OutputContract:
+        """Build the schema contract expected from non-manager staff output."""
+        return OutputContract(
+            name="TaskExecutionResult",
+            json_schema=TaskExecutionResult.model_json_schema(),
+            instructions=(
+                "Produce the assigned staff member's structured task output. "
+                "Describe what you completed for this task only; do not create "
+                "or modify the project staffing plan."
             ),
         )
 
@@ -374,24 +398,32 @@ class SinglePassStaffWorkflow:
         )
         return response
 
-    def parse_output(self, content: str, project: Project):
-        """Turn assistant text into the structured project result contract."""
+    def parse_output(
+        self,
+        content: str,
+        project: Project,
+        staff: Staff,
+        task: Task,
+    ) -> ProjectResult | TaskExecutionResult:
+        """Turn assistant text into the structured contract for this staff."""
         self.hook_calls.append("parse_output")
         logger.debug(
             "workflow hook parse_output",
-            extra={"project_id": project.id, "task_id": self._primary_task_id(project)},
+            extra={"project_id": project.id, "staff_id": staff.id, "task_id": task.id},
         )
         self.event_recorder.project_event(
             project,
             "workflow_hook",
             "Parsing assistant output.",
-            actor_id=project.manager_id,
-            task_id=self._primary_task_id(project),
+            actor_id=staff.id,
+            task_id=task.id,
             data={"hook": "parse_output"},
         )
-        return self.output_parser.parse(content, project)
+        if staff.role == "project_manager":
+            return self.output_parser.parse(content, project)
+        return self.task_output_parser.parse(content, project, task)
 
-    def update_memory(self, project: Project, staff: Staff, content: str) -> None:
+    def update_memory(self, project: Project, staff: Staff, task: Task, content: str) -> None:
         """Store useful output for future retrieval.
 
         The default memory manager ignores this call in Version 1.
@@ -402,7 +434,7 @@ class SinglePassStaffWorkflow:
             extra={
                 "project_id": project.id,
                 "staff_id": staff.id,
-                "task_id": self._primary_task_id(project),
+                "task_id": task.id,
                 "content_length": len(content),
             },
         )
@@ -411,16 +443,22 @@ class SinglePassStaffWorkflow:
             "workflow_hook",
             "Updating memory.",
             actor_id=staff.id,
-            task_id=self._primary_task_id(project),
+            task_id=task.id,
             data={"hook": "update_memory"},
         )
         self.memory_manager.remember(
             project,
             staff,
-            MemoryItem(scope="project", content=content, tags=["project_result"]),
+            MemoryItem(scope="project", content=content, tags=[staff.role, "task_result"]),
         )
 
-    def report_result(self, staff: Staff, task: Task, output: str, project_result) -> WorkResult:
+    def report_result(
+        self,
+        staff: Staff,
+        task: Task,
+        output: str,
+        parsed_output: ProjectResult | TaskExecutionResult,
+    ) -> WorkResult:
         """Finalize task and staff status and return a workflow result."""
         self.hook_calls.append("report_result")
         logger.debug(
@@ -439,11 +477,248 @@ class SinglePassStaffWorkflow:
             task_id=task.id,
             status=task.status,
             output=output,
-            project_result=project_result,
+            project_result=parsed_output if isinstance(parsed_output, ProjectResult) else None,
+            task_result=parsed_output if isinstance(parsed_output, TaskExecutionResult) else None,
         )
 
-    def _primary_task_id(self, project: Project) -> str | None:
-        """Return the only task id used by Version 1 PM-only orchestration."""
-        if not project.tasks:
-            return None
-        return next(iter(project.tasks))
+    def _final_output(self, parsed_output: ProjectResult | TaskExecutionResult) -> str:
+        """Return the text stored on Task.result for either output contract."""
+        return parsed_output.final_output
+
+
+class IterativeStaffWorkflow(SinglePassStaffWorkflow):
+    """Multi-round staff workflow with structured-output validation retries.
+
+    This V2B-1 implementation does not execute real tool calls yet. Its job is
+    to keep one task conversation alive when the assistant returns invalid
+    structured output, append validation feedback, and retry within configured
+    limits.
+    """
+
+    def __init__(
+        self,
+        workflow_config: WorkflowConfig | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.workflow_config = workflow_config or WorkflowConfig(type="iterative")
+
+    def run(self, project: Project, staff: Staff, task: Task) -> WorkResult:
+        """Run one staff task across multiple assistant steps when needed."""
+        try:
+            logger.info(
+                "iterative staff workflow started",
+                extra={
+                    "project_id": project.id,
+                    "staff_id": staff.id,
+                    "task_id": task.id,
+                    "max_steps": self.workflow_config.max_steps,
+                    "max_output_retries": self.workflow_config.max_output_retries,
+                },
+            )
+            self.event_recorder.project_event(
+                project,
+                "workflow_started",
+                f"Iterative workflow started for task '{task.title}'.",
+                actor_id=staff.id,
+                task_id=task.id,
+            )
+            self.receive_task(staff, task)
+            context = self.build_context(project, staff, task)
+            memories = self.retrieve_memory(project, staff, task, context)
+            skills = self.select_skills(project, staff, task, context)
+            tools = self.select_tools(project, staff, task)
+            request = self.plan_work(project, staff, task, context, skills, tools, memories)
+
+            output_retry_count = 0
+            last_error: Exception | None = None
+            for step_number in range(1, self.workflow_config.max_steps + 1):
+                self._record_step_started(project, staff, task, step_number)
+                response = self.execute_work(staff, request)
+                try:
+                    parsed_output = self.parse_output_strict(response.content, project, staff, task)
+                except Exception as exc:
+                    last_error = exc
+                    output_retry_count += 1
+                    self._record_output_validation_failed(
+                        project,
+                        staff,
+                        task,
+                        step_number,
+                        output_retry_count,
+                        exc,
+                    )
+                    if output_retry_count > self.workflow_config.max_output_retries:
+                        raise ValueError("assistant output remained invalid after retries") from exc
+                    request.messages.append(self._validation_feedback_message(exc))
+                    self._record_step_completed(project, staff, task, step_number, "retry")
+                    continue
+
+                final_output = self._final_output(parsed_output)
+                self.update_memory(project, staff, task, final_output)
+                result = self.report_result(staff, task, final_output, parsed_output)
+                self._record_step_completed(project, staff, task, step_number, "done")
+                self.event_recorder.project_event(
+                    project,
+                    "workflow_completed",
+                    f"Iterative workflow completed for task '{task.title}'.",
+                    actor_id=staff.id,
+                    task_id=task.id,
+                    data={"step_count": step_number, "output_retry_count": output_retry_count},
+                )
+                logger.info(
+                    "iterative staff workflow completed",
+                    extra={
+                        "project_id": project.id,
+                        "staff_id": staff.id,
+                        "task_id": task.id,
+                        "status": result.status.value,
+                        "step_count": step_number,
+                    },
+                )
+                return result
+
+            self.event_recorder.project_event(
+                project,
+                "workflow_step_limit_reached",
+                "Workflow reached max_steps before producing valid output.",
+                level=EventLevel.ERROR,
+                actor_id=staff.id,
+                task_id=task.id,
+                data={"max_steps": self.workflow_config.max_steps},
+            )
+            raise ValueError("workflow reached max_steps before producing valid output") from last_error
+        except Exception as exc:
+            return self._failed_work_result(project, staff, task, exc)
+
+    def parse_output_strict(
+        self,
+        content: str,
+        project: Project,
+        staff: Staff,
+        task: Task,
+    ) -> ProjectResult | TaskExecutionResult:
+        """Parse assistant output without fallback so invalid output can retry."""
+        self.hook_calls.append("parse_output")
+        logger.debug(
+            "workflow hook parse_output_strict",
+            extra={"project_id": project.id, "staff_id": staff.id, "task_id": task.id},
+        )
+        self.event_recorder.project_event(
+            project,
+            "workflow_hook",
+            "Parsing assistant output strictly.",
+            actor_id=staff.id,
+            task_id=task.id,
+            data={"hook": "parse_output_strict"},
+        )
+        if staff.role == "project_manager":
+            return self.output_parser.parse_strict(content, project)
+        return self.task_output_parser.parse_strict(content, project, task)
+
+    def _validation_feedback_message(self, exc: Exception) -> Message:
+        """Tell the assistant exactly why another structured response is needed."""
+        return Message(
+            role="user",
+            content=(
+                "The previous response did not match the required JSON output "
+                f"contract. Error: {exc.__class__.__name__}: {exc}. "
+                "Return exactly one valid JSON object that matches the requested "
+                "output contract. Do not include Markdown fences or prose."
+            ),
+        )
+
+    def _record_step_started(
+        self,
+        project: Project,
+        staff: Staff,
+        task: Task,
+        step_number: int,
+    ) -> None:
+        self.event_recorder.project_event(
+            project,
+            "workflow_step_started",
+            f"Workflow step {step_number} started.",
+            actor_id=staff.id,
+            task_id=task.id,
+            data={"step": step_number},
+        )
+
+    def _record_step_completed(
+        self,
+        project: Project,
+        staff: Staff,
+        task: Task,
+        step_number: int,
+        outcome: str,
+    ) -> None:
+        self.event_recorder.project_event(
+            project,
+            "workflow_step_completed",
+            f"Workflow step {step_number} completed with outcome '{outcome}'.",
+            actor_id=staff.id,
+            task_id=task.id,
+            data={"step": step_number, "outcome": outcome},
+        )
+
+    def _record_output_validation_failed(
+        self,
+        project: Project,
+        staff: Staff,
+        task: Task,
+        step_number: int,
+        retry_count: int,
+        exc: Exception,
+    ) -> None:
+        self.event_recorder.project_event(
+            project,
+            "output_validation_failed",
+            "Assistant output did not match the requested contract.",
+            level=EventLevel.WARNING,
+            actor_id=staff.id,
+            task_id=task.id,
+            data={
+                "step": step_number,
+                "retry_count": retry_count,
+                "error_type": exc.__class__.__name__,
+            },
+        )
+
+    def _failed_work_result(
+        self,
+        project: Project,
+        staff: Staff,
+        task: Task,
+        exc: Exception,
+    ) -> WorkResult:
+        """Convert iterative workflow failures into task state and events."""
+        logger.exception(
+            "iterative staff workflow failed",
+            extra={
+                "project_id": project.id,
+                "staff_id": staff.id,
+                "task_id": task.id,
+                "error_type": exc.__class__.__name__,
+            },
+        )
+        error = TaskError(type=exc.__class__.__name__, message=str(exc))
+        task.status = TaskStatus.FAILED
+        task.error = error
+        staff.status = StaffStatus.IDLE
+        staff.current_task_id = None
+        self.event_recorder.project_event(
+            project,
+            "workflow_failed",
+            str(exc),
+            level=EventLevel.ERROR,
+            actor_id=staff.id,
+            task_id=task.id,
+        )
+        self.event_recorder.task_event(
+            task,
+            "task_failed",
+            str(exc),
+            level=EventLevel.ERROR,
+            actor_id=staff.id,
+        )
+        return WorkResult(staff_id=staff.id, task_id=task.id, status=task.status, error=error)

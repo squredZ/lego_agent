@@ -9,6 +9,7 @@ from lego_agent.assistants.openai_assistant import OpenAIAssistant
 from lego_agent.cli import main
 from lego_agent.core.models import (
     AssistantRequest,
+    AssistantResponse,
     Project,
     ProjectStatus,
     Staff,
@@ -17,6 +18,7 @@ from lego_agent.core.models import (
     StaffRolePlan,
     StaffingPlan,
     Task,
+    TaskExecutionResult,
     TaskStatus,
     WorkResult,
     WorkContext,
@@ -30,10 +32,10 @@ from lego_agent.project.interaction import (
     TaskDispatcher,
 )
 from lego_agent.project.runtime import create_project_runtime
-from lego_agent.project.staffing import StaffFactory, StaffProfileResolver
+from lego_agent.project.staffing import StaffFactory, StaffProfileResolver, normalize_staff_role_id
 from lego_agent.workflow.managers import NoopMemoryManager, NoopSkillManager, NoopToolManager
 from lego_agent.workflow.output import ProjectResultOutputParser
-from lego_agent.workflow.staff_workflow import SinglePassStaffWorkflow
+from lego_agent.workflow.staff_workflow import IterativeStaffWorkflow, SinglePassStaffWorkflow
 
 
 @pytest.fixture(autouse=True)
@@ -245,7 +247,31 @@ def test_parses_project_runtime_config() -> None:
 
     assert config.project.default_manager_profile == "project_manager"
     assert config.orchestration.strategy == "project_manager_only"
+    assert config.workflow.type == "single_pass"
     assert config.staff_profiles["project_manager"].assistant.token_limit == 2048
+
+
+def test_parses_iterative_workflow_config() -> None:
+    raw_config = _config()
+    raw_config["workflow"] = {
+        "type": "iterative",
+        "max_steps": 4,
+        "max_output_retries": 1,
+    }
+
+    config = parse_project_runtime_config(raw_config)
+
+    assert config.workflow.type == "iterative"
+    assert config.workflow.max_steps == 4
+    assert config.workflow.max_output_retries == 1
+
+
+def test_rejects_invalid_workflow_limits() -> None:
+    raw_config = _config()
+    raw_config["workflow"] = {"type": "iterative", "max_steps": 0}
+
+    with pytest.raises(ValueError):
+        parse_project_runtime_config(raw_config)
 
 
 def test_project_manager_only_dry_run_returns_project_result() -> None:
@@ -258,6 +284,16 @@ def test_project_manager_only_dry_run_returns_project_result() -> None:
     assert result.result is not None
     assert result.result.staffing_plan.required_roles
     assert "Build a project-oriented agent framework" in result.result.project_understanding
+
+
+def test_runtime_creates_iterative_workflow_from_config() -> None:
+    raw_config = _config()
+    raw_config["workflow"] = {"type": "iterative", "max_steps": 3}
+
+    runtime = create_project_runtime(parse_project_runtime_config(raw_config))
+
+    assert isinstance(runtime.workflow, IterativeStaffWorkflow)
+    assert runtime.workflow.workflow_config.max_steps == 3
 
 
 def test_project_run_records_events() -> None:
@@ -285,6 +321,37 @@ def test_project_run_attaches_staff_profile_resolution() -> None:
     assert match.planned_role == "implementation_staff"
     assert match.profile_name == "implementation_staff"
     assert match.source == "profile"
+
+
+def test_project_manager_with_staff_creates_recruited_staff_and_child_tasks() -> None:
+    raw_config = _config_with_staff_profiles()
+    raw_config["orchestration"] = {"strategy": "project_manager_with_staff"}
+    runtime = create_project_runtime(parse_project_runtime_config(raw_config))
+    project = runtime.create_project("Build a project-oriented agent framework")
+
+    result = runtime.orchestrator.run(project)
+
+    assert result.status == ProjectStatus.REVIEWING
+    assert result.completed_at is not None
+    assert project.completed_at is None
+    assert "implementation_staff" in project.staff
+    assert project.staff["implementation_staff"].manager_id == "project_manager"
+    child_tasks = [
+        task
+        for task in project.tasks.values()
+        if task.parent_task_id == _manager_task(project).id
+    ]
+    assert len(child_tasks) == 1
+    assert child_tasks[0].assigned_to == "implementation_staff"
+    assert child_tasks[0].status == TaskStatus.DONE
+    assert child_tasks[0].result is not None
+    assert "implementation_staff handled" in child_tasks[0].result
+    event_types = [event.type for event in result.events]
+    assert "staff_created" in event_types
+    assert "task_assigned" in event_types
+    assert "project_staffing_completed" in event_types
+    assert "child_task_execution_started" in event_types
+    assert "project_ready_for_review" in event_types
 
 
 def test_staff_profile_resolver_marks_unknown_roles_as_dynamic() -> None:
@@ -334,6 +401,52 @@ def test_staff_factory_creates_dynamic_staff_from_role_plan() -> None:
     assert staff.responsibilities[0].name == "security_review"
     assert staff.capabilities[0].name == "threat_modeling"
     assert isinstance(staff.assistant, OpenAIAssistant)
+
+
+def test_dynamic_staff_role_ids_are_normalized_for_runtime_state() -> None:
+    config = parse_project_runtime_config(_config())
+    role_plan = StaffRolePlan(
+        role="Frontend Developer",
+        title="Frontend Developer",
+        responsibilities=["implementation"],
+        capabilities=["execution_planning"],
+        task_focus="Build the minimal UI.",
+    )
+    factory = StaffFactory(
+        config.staff_profiles,
+        config.dynamic_staff,
+        lambda assistant_config: OpenAIAssistant(**assistant_config.to_assistant_kwargs()),
+    )
+
+    staff = factory.create_from_plan(role_plan, "project", manager_id="project_manager")
+
+    assert normalize_staff_role_id("Frontend Developer") == "frontend_developer"
+    assert staff.id == "frontend_developer"
+    assert staff.role == "frontend_developer"
+    assert staff.title == "Frontend Developer"
+    assert staff.metadata["planned_role"] == "Frontend Developer"
+
+
+def test_staff_profile_resolver_matches_normalized_role_to_profile() -> None:
+    config = parse_project_runtime_config(_config_with_staff_profiles())
+    staffing_plan = StaffingPlan(
+        required_roles=[
+            StaffRolePlan(
+                role="Implementation Staff",
+                title="Implementation Staff",
+                responsibilities=["implementation"],
+                capabilities=["execution_planning"],
+                task_focus="Implement the project.",
+            )
+        ],
+        rationale="Implementation is required.",
+    )
+
+    resolution = StaffProfileResolver(config.staff_profiles, config.dynamic_staff).resolve(staffing_plan)
+
+    assert resolution.matches[0].matched is True
+    assert resolution.matches[0].source == "profile"
+    assert resolution.matches[0].profile_name == "implementation_staff"
 
 
 def test_project_run_emits_useful_logs(caplog) -> None:
@@ -410,6 +523,116 @@ def test_workflow_adds_project_result_output_contract() -> None:
     assert "Return exactly one JSON object" in user_prompt
     assert "Do not use Markdown fences" in user_prompt
     assert "at most 3 assumptions" in user_prompt
+
+
+def test_workflow_adds_task_execution_output_contract_for_worker() -> None:
+    captured = {}
+
+    class CapturingAssistant:
+        """Test fake that records the worker request."""
+
+        def respond(self, request):
+            captured["request"] = request
+            return OpenAIAssistant(model="test-model", dry_run=True).respond(request)
+
+    project, _manager, worker = _project_with_worker()
+    worker.assistant = CapturingAssistant()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=project.manager_id,
+    )
+    project.tasks[task.id] = task
+
+    result = SinglePassStaffWorkflow().run(project, worker, task)
+    request = captured["request"]
+
+    assert result.status == TaskStatus.DONE
+    assert isinstance(result.task_result, TaskExecutionResult)
+    assert result.project_result is None
+    assert request.output_contract.name == "TaskExecutionResult"
+    assert request.output_schema["title"] == "TaskExecutionResult"
+    assert "TaskExecutionResult" in request.messages[-1].content
+
+
+def test_iterative_workflow_retries_invalid_output_and_succeeds() -> None:
+    class InvalidThenValidAssistant:
+        """Test fake that returns invalid JSON once, then a valid task result."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.message_counts: list[int] = []
+
+        def respond(self, request):
+            self.calls += 1
+            self.message_counts.append(len(request.messages))
+            if self.calls == 1:
+                return AssistantResponse(content="not json")
+            return AssistantResponse(
+                content=TaskExecutionResult(
+                    summary="Implemented task.",
+                    work_performed=["Retried after validation feedback."],
+                    deliverables=["Valid task output."],
+                    final_output="Valid final output.",
+                ).model_dump_json()
+            )
+
+    project, _manager, worker = _project_with_worker()
+    assistant = InvalidThenValidAssistant()
+    worker.assistant = assistant
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=project.manager_id,
+    )
+    project.tasks[task.id] = task
+    workflow = IterativeStaffWorkflow()
+
+    result = workflow.run(project, worker, task)
+
+    assert result.status == TaskStatus.DONE
+    assert result.output == "Valid final output."
+    assert assistant.calls == 2
+    assert assistant.message_counts[1] == assistant.message_counts[0] + 1
+    event_types = [event.type for event in project.events]
+    assert "output_validation_failed" in event_types
+    assert "workflow_step_started" in event_types
+    assert "workflow_step_completed" in event_types
+
+
+def test_iterative_workflow_fails_after_output_retry_limit() -> None:
+    class AlwaysInvalidAssistant:
+        """Test fake that never satisfies the structured output contract."""
+
+        def respond(self, request):
+            return AssistantResponse(content="not json")
+
+    project, _manager, worker = _project_with_worker()
+    worker.assistant = AlwaysInvalidAssistant()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=project.manager_id,
+    )
+    project.tasks[task.id] = task
+    workflow = IterativeStaffWorkflow(
+        workflow_config=parse_project_runtime_config(
+            {**_config(), "workflow": {"type": "iterative", "max_steps": 3, "max_output_retries": 1}}
+        ).workflow
+    )
+
+    result = workflow.run(project, worker, task)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.error is not None
+    assert "invalid after retries" in result.error.message
+    assert any(event.type == "workflow_failed" for event in project.events)
 
 
 def test_failed_workflow_records_error_events() -> None:
