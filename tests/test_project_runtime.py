@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from types import SimpleNamespace
 
@@ -10,26 +11,32 @@ from lego_agent.cli import main
 from lego_agent.core.models import (
     AssistantRequest,
     AssistantResponse,
+    ManagerAction,
+    ManagerDecision,
     Message,
     Project,
     ProjectStatus,
     Staff,
     StaffInbox,
     StaffMessage,
+    StaffMessageType,
     StaffRolePlan,
     StaffingPlan,
     Task,
     TaskExecutionResult,
     TaskStatus,
     ToolCall,
+    ToolResult,
     WorkResult,
     WorkContext,
 )
 from lego_agent.project.config import parse_project_runtime_config
+from lego_agent.project.control import ManagerControlLoop
 from lego_agent.project.events import EventRecorder
 from lego_agent.project.interaction import (
     InMemoryMessageBus,
     InMemoryTaskStore,
+    StaffCommunicationService,
     TaskCompletionHandler,
     TaskDispatcher,
 )
@@ -38,6 +45,7 @@ from lego_agent.project.staffing import StaffFactory, StaffProfileResolver, norm
 from lego_agent.workflow.managers import BuiltinToolManager, NoopMemoryManager, NoopSkillManager, NoopToolManager
 from lego_agent.workflow.output import ProjectResultOutputParser
 from lego_agent.workflow.staff_workflow import IterativeStaffWorkflow, SinglePassStaffWorkflow
+from lego_agent.workflow.tools import ToolRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -189,6 +197,83 @@ def test_in_memory_message_bus_tracks_unread_messages() -> None:
     assert bus.unread_for("worker", "project") == []
 
 
+def test_staff_communication_service_sends_question_between_staff() -> None:
+    project, _manager, worker = _project_with_worker()
+    reviewer = Staff(
+        id="review_staff",
+        project_id=project.id,
+        name="Ravi",
+        role="review_staff",
+        title="Review Staff",
+        manager_id=project.manager_id,
+    )
+    project.staff[reviewer.id] = reviewer
+    message_bus = InMemoryMessageBus()
+    communication = StaffCommunicationService(message_bus, EventRecorder())
+
+    message = communication.ask_question(
+        project,
+        worker,
+        reviewer,
+        "Can you review this implementation approach?",
+    )
+
+    reviewer_messages = message_bus.unread_for(reviewer.id, project.id)
+    assert reviewer_messages == [message]
+    assert message.type == StaffMessageType.QUESTION
+    assert message.sender_id == worker.id
+    assert message.recipient_id == reviewer.id
+    assert any(event.type == "staff_message_sent" for event in project.events)
+
+
+def test_staff_communication_service_can_request_help_for_task() -> None:
+    project, manager, worker = _project_with_worker()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+    )
+    project.tasks[task.id] = task
+    message_bus = InMemoryMessageBus()
+    communication = StaffCommunicationService(message_bus, EventRecorder())
+
+    message = communication.request_help(
+        project,
+        worker,
+        manager,
+        "I need clarification on acceptance criteria.",
+        task=task,
+    )
+
+    manager_messages = message_bus.unread_for(manager.id, project.id)
+    assert manager_messages == [message]
+    assert message.type == StaffMessageType.HELP_REQUESTED
+    assert message.task_id == task.id
+    assert project.events[-1].data["message_type"] == "help_requested"
+
+
+def test_staff_communication_service_rejects_external_recipient() -> None:
+    project, _manager, worker = _project_with_worker()
+    outsider = Staff(
+        id="outsider",
+        project_id="other-project",
+        name="Owen",
+        role="review_staff",
+        title="Review Staff",
+    )
+    communication = StaffCommunicationService(InMemoryMessageBus(), EventRecorder())
+
+    with pytest.raises(ValueError):
+        communication.report_blocker(
+            project,
+            worker,
+            outsider,
+            "I cannot access required context.",
+        )
+
+
 def test_task_dispatcher_assigns_task_and_notifies_worker() -> None:
     project, manager, worker = _project_with_worker()
     task_store = InMemoryTaskStore(project)
@@ -238,10 +323,56 @@ def test_task_completion_handler_notifies_manager() -> None:
     assert project.tasks[child_task.id].status == TaskStatus.DONE
     assert project.tasks[child_task.id].result == "Implemented core runtime."
     manager_messages = message_bus.unread_for(manager.id, project.id)
-    assert manager_messages[0].type == "task_completed"
+    assert manager_messages[0].type == StaffMessageType.TASK_COMPLETED
     assert manager_messages[0].sender_id == worker.id
     assert any(event.type == "task_completed" for event in project.events)
     assert any(event.type == "task_completed" for event in child_task.events)
+
+
+def test_task_completion_handler_reports_structured_blockers_to_manager() -> None:
+    project, manager, worker = _project_with_worker()
+    child_task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+        parent_task_id="manager-task",
+    )
+    project.tasks[child_task.id] = child_task
+    message_bus = InMemoryMessageBus()
+    completion_handler = TaskCompletionHandler(
+        InMemoryTaskStore(project),
+        message_bus,
+        EventRecorder(),
+    )
+    task_result = TaskExecutionResult(
+        summary="Partially completed.",
+        work_performed=["Reviewed available context."],
+        deliverables=[],
+        blockers=["Acceptance criteria are unclear."],
+        final_output="Need clarification before final implementation.",
+    )
+    work_result = WorkResult(
+        staff_id=worker.id,
+        task_id=child_task.id,
+        status=TaskStatus.DONE,
+        output=task_result.final_output,
+        task_result=task_result,
+    )
+
+    completion_handler.complete(project, child_task, worker, work_result)
+
+    manager_messages = message_bus.unread_for(manager.id, project.id)
+    blocker_messages = [
+        message
+        for message in manager_messages
+        if message.type == StaffMessageType.BLOCKER_REPORTED
+    ]
+    assert len(blocker_messages) == 1
+    assert "Acceptance criteria" in blocker_messages[0].content
+    assert blocker_messages[0].data["blocker_count"] == 1
+    assert any(event.type == "staff_blocker_reported" for event in project.events)
 
 
 def test_parses_project_runtime_config() -> None:
@@ -251,6 +382,25 @@ def test_parses_project_runtime_config() -> None:
     assert config.orchestration.strategy == "project_manager_only"
     assert config.workflow.type == "single_pass"
     assert config.staff_profiles["project_manager"].assistant.token_limit == 2048
+
+
+def test_parses_cli_defaults_from_config() -> None:
+    raw_config = _config()
+    raw_config["project"]["goal"] = "Build from config."
+    raw_config["cli"] = {
+        "log_level": "INFO",
+        "output_json": True,
+        "include_events": True,
+        "include_staffing_matches": True,
+    }
+
+    config = parse_project_runtime_config(raw_config)
+
+    assert config.project.goal == "Build from config."
+    assert config.cli.log_level == "INFO"
+    assert config.cli.output_json is True
+    assert config.cli.include_events is True
+    assert config.cli.include_staffing_matches is True
 
 
 def test_parses_iterative_workflow_config() -> None:
@@ -358,27 +508,247 @@ def test_project_manager_with_staff_creates_recruited_staff_and_child_tasks() ->
 
     result = runtime.orchestrator.run(project)
 
-    assert result.status == ProjectStatus.REVIEWING
+    assert result.status == ProjectStatus.DONE
     assert result.completed_at is not None
-    assert project.completed_at is None
+    assert project.completed_at is not None
     assert "implementation_staff" in project.staff
     assert project.staff["implementation_staff"].manager_id == "project_manager"
+    manager_task = _manager_task(project)
     child_tasks = [
         task
         for task in project.tasks.values()
-        if task.parent_task_id == _manager_task(project).id
+        if task.parent_task_id == manager_task.id and task.assigned_to != project.manager_id
+    ]
+    review_tasks = [
+        task
+        for task in project.tasks.values()
+        if task.parent_task_id == manager_task.id and task.assigned_to == project.manager_id
     ]
     assert len(child_tasks) == 1
+    assert len(review_tasks) == 1
     assert child_tasks[0].assigned_to == "implementation_staff"
     assert child_tasks[0].status == TaskStatus.DONE
     assert child_tasks[0].result is not None
     assert "implementation_staff handled" in child_tasks[0].result
+    assert review_tasks[0].title == "Manager final review"
+    assert review_tasks[0].status == TaskStatus.DONE
     event_types = [event.type for event in result.events]
     assert "staff_created" in event_types
     assert "task_assigned" in event_types
     assert "project_staffing_completed" in event_types
     assert "child_task_execution_started" in event_types
+    assert "manager_control_round_started" in event_types
+    assert "manager_decision_made" in event_types
+    assert "manager_control_round_completed" in event_types
     assert "project_ready_for_review" in event_types
+    assert "project_review_started" in event_types
+    assert "project_completed" in event_types
+
+
+def test_manager_control_loop_waits_for_unfinished_tasks() -> None:
+    project, manager, worker = _project_with_worker()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    project.tasks[task.id] = task
+    message_bus = InMemoryMessageBus()
+    control_loop = ManagerControlLoop(EventRecorder())
+
+    decision = control_loop.decide(project, manager, [task], message_bus)
+
+    assert decision.action == ManagerAction.WAIT
+    assert decision.project_status == project.status
+    assert decision.task_ids == [task.id]
+    assert any(event.type == "manager_decision_made" for event in project.events)
+
+
+def test_manager_control_loop_snapshot_includes_unread_message_summaries() -> None:
+    project, manager, worker = _project_with_worker()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+    )
+    project.tasks[task.id] = task
+    message_bus = InMemoryMessageBus()
+    message_bus.send(
+        StaffMessage(
+            project_id=project.id,
+            sender_id=worker.id,
+            recipient_id=manager.id,
+            type=StaffMessageType.QUESTION,
+            task_id=task.id,
+            content="Can you clarify the acceptance criteria?",
+        )
+    )
+    control_loop = ManagerControlLoop(EventRecorder())
+
+    snapshot = control_loop.snapshot(project, manager, [task], message_bus)
+
+    assert snapshot.unread_manager_message_count == 1
+    assert snapshot.unread_manager_messages[0].type == StaffMessageType.QUESTION
+    assert snapshot.unread_manager_messages[0].task_id == task.id
+    assert "acceptance criteria" in snapshot.unread_manager_messages[0].content_summary
+
+
+def test_manager_control_loop_asks_user_when_staff_needs_clarification() -> None:
+    project, manager, worker = _project_with_worker()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+        status=TaskStatus.DONE,
+        result="Implementation draft is ready.",
+    )
+    project.tasks[task.id] = task
+    message_bus = InMemoryMessageBus()
+    message_bus.send(
+        StaffMessage(
+            project_id=project.id,
+            sender_id=worker.id,
+            recipient_id=manager.id,
+            type=StaffMessageType.HELP_REQUESTED,
+            task_id=task.id,
+            content="I need user clarification before final review.",
+        )
+    )
+    control_loop = ManagerControlLoop(EventRecorder())
+
+    decision = control_loop.decide(project, manager, [task], message_bus)
+
+    assert decision.action == ManagerAction.ASK_USER
+    assert decision.task_ids == [task.id]
+
+
+def test_manager_control_loop_reviews_completed_tasks() -> None:
+    project, manager, worker = _project_with_worker()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+        status=TaskStatus.DONE,
+        result="Implemented core runtime.",
+    )
+    project.tasks[task.id] = task
+    control_loop = ManagerControlLoop(EventRecorder())
+
+    decision = control_loop.decide(project, manager, [task], InMemoryMessageBus())
+
+    assert decision.action == ManagerAction.REVIEW
+    assert decision.project_status == ProjectStatus.REVIEWING
+    assert decision.task_ids == [task.id]
+
+
+def test_project_manager_orchestrator_applies_ask_user_decision() -> None:
+    raw_config = _config_with_staff_profiles()
+    raw_config["orchestration"] = {"strategy": "project_manager_with_staff"}
+    runtime = create_project_runtime(parse_project_runtime_config(raw_config))
+    project = runtime.create_project("Build a project-oriented agent framework")
+    manager = project.manager
+    manager_task = _manager_task(project)
+    decision = ManagerDecision(
+        action=ManagerAction.ASK_USER,
+        rationale="Need user clarification.",
+        task_ids=["task-1"],
+    )
+
+    completed_at = runtime.orchestrator._apply_manager_decision(
+        project,
+        manager,
+        manager_task,
+        [],
+        decision,
+    )
+
+    assert completed_at is not None
+    assert project.status == ProjectStatus.RUNNING
+    assert project.error is None
+    assert any(event.type == "project_user_input_requested" for event in project.events)
+
+
+def test_project_manager_control_loop_stops_when_user_input_is_needed() -> None:
+    raw_config = _config_with_staff_profiles()
+    raw_config["orchestration"] = {"strategy": "project_manager_with_staff"}
+    runtime = create_project_runtime(parse_project_runtime_config(raw_config))
+    project = runtime.create_project("Build a project-oriented agent framework")
+    manager = project.manager
+    manager_task = _manager_task(project)
+    message_bus = InMemoryMessageBus()
+    worker = Staff(
+        id="implementation_staff",
+        project_id=project.id,
+        name="Iris",
+        role="implementation_staff",
+        title="Implementation Staff",
+        manager_id=manager.id,
+    )
+    project.staff[worker.id] = worker
+    child_task = Task(
+        project_id=project.id,
+        title="Implementation task",
+        goal="Implement the project.",
+        assigned_to=worker.id,
+        created_by=manager.id,
+        parent_task_id=manager_task.id,
+        status=TaskStatus.DONE,
+        result="Implementation is blocked by unclear acceptance criteria.",
+    )
+    project.tasks[child_task.id] = child_task
+    message_bus.send(
+        StaffMessage(
+            project_id=project.id,
+            sender_id=worker.id,
+            recipient_id=manager.id,
+            type=StaffMessageType.BLOCKER_REPORTED,
+            task_id=child_task.id,
+            content="Acceptance criteria are unclear.",
+        )
+    )
+
+    completed_at = runtime.orchestrator._run_manager_control_loop(
+        project,
+        manager,
+        manager_task,
+        [child_task],
+        message_bus,
+    )
+
+    event_types = [event.type for event in project.events]
+    assert completed_at is not None
+    assert project.status == ProjectStatus.RUNNING
+    assert "project_user_input_requested" in event_types
+    assert "project_review_started" not in event_types
+
+
+def test_manager_control_loop_fails_when_child_task_failed() -> None:
+    project, manager, worker = _project_with_worker()
+    task = Task(
+        project_id=project.id,
+        title="Implement core runtime",
+        goal="Implement core runtime",
+        assigned_to=worker.id,
+        created_by=manager.id,
+        status=TaskStatus.FAILED,
+    )
+    project.tasks[task.id] = task
+    control_loop = ManagerControlLoop(EventRecorder())
+
+    decision = control_loop.decide(project, manager, [task], InMemoryMessageBus())
+
+    assert decision.action == ManagerAction.FAIL
+    assert decision.project_status == ProjectStatus.FAILED
+    assert decision.task_ids == [task.id]
 
 
 def test_staff_profile_resolver_marks_unknown_roles_as_dynamic() -> None:
@@ -818,6 +1188,41 @@ def test_builtin_tool_manager_blocks_file_outside_workspace(tmp_path) -> None:
     assert result.error == "path is outside the workspace"
 
 
+def test_builtin_tool_manager_delegates_to_registered_tools() -> None:
+    class UppercaseTool:
+        """Test-only tool that proves manager behavior is registry-driven."""
+
+        name = "uppercase"
+        description = "Uppercase text."
+        parameters_schema = {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        }
+
+        def call(self, arguments):
+            return ToolResult(
+                tool_name=self.name,
+                success=True,
+                content=str(arguments["text"]).upper(),
+            )
+
+    manager = BuiltinToolManager(
+        enabled_tools=["uppercase"],
+        registry=ToolRegistry([UppercaseTool()]),
+    )
+
+    specs = manager.list_tools(
+        Staff(id="pm", project_id="project", name="Ava", role="project_manager", title="Project Manager"),
+        Task(project_id="project", title="Plan", goal="Plan"),
+    )
+    result = manager.call_tool(ToolCall(tool_name="uppercase", arguments={"text": "hello"}))
+
+    assert [spec.name for spec in specs] == ["uppercase"]
+    assert result.success is True
+    assert result.content == "HELLO"
+
+
 def test_project_result_parser_accepts_valid_json() -> None:
     staff = Staff(
         id="pm",
@@ -1068,13 +1473,58 @@ def test_cli_project_run_json(capsys) -> None:
     assert '"manager_id": "project_manager"' in output
 
 
-def test_cli_human_output_hides_events_by_default(capsys) -> None:
+def test_cli_project_run_uses_configured_goal(capsys, tmp_path) -> None:
+    config_path = tmp_path / "runtime.json"
+    raw_config = _config()
+    raw_config["project"]["goal"] = "Build from config goal"
+    config_path.write_text(json.dumps(raw_config), encoding="utf-8")
+
     exit_code = main(
         [
             "project",
             "run",
             "--config",
-            "configs/project_runtime.json",
+            str(config_path),
+            "--json",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Build from config goal" in output
+
+
+def test_cli_project_run_uses_configured_output_defaults(capsys, tmp_path) -> None:
+    config_path = tmp_path / "runtime.json"
+    raw_config = _config()
+    raw_config["project"]["goal"] = "Build from config goal"
+    raw_config["cli"] = {"output_json": True}
+    config_path.write_text(json.dumps(raw_config), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "project",
+            "run",
+            "--config",
+            str(config_path),
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert '"project_goal": "Build from config goal"' in output
+
+
+def test_cli_human_output_hides_events_by_default(capsys, tmp_path) -> None:
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(json.dumps(_config()), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "project",
+            "run",
+            "--config",
+            str(config_path),
             "Build a project-oriented agent framework",
         ]
     )

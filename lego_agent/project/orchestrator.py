@@ -4,6 +4,8 @@ import logging
 
 from lego_agent.core.models import (
     EventLevel,
+    ManagerAction,
+    ManagerDecision,
     Project,
     ProjectError,
     ProjectRunResult,
@@ -12,8 +14,10 @@ from lego_agent.core.models import (
     StaffRolePlan,
     Task,
     TaskStatus,
+    WorkResult,
     utc_now,
 )
+from lego_agent.project.control import ManagerControlLoop
 from lego_agent.project.events import EventRecorder
 from lego_agent.project.interaction import (
     InMemoryMessageBus,
@@ -144,8 +148,8 @@ class ProjectManagerWithStaffOrchestrator:
 
     This strategy runs the project manager, creates recruited staff from the
     resulting staffing plan, assigns one child task to each recruited staff
-    member, then executes those child tasks synchronously. Manager review is
-    still a later phase, so a successful run ends in `REVIEWING`.
+    member, executes those child tasks synchronously, then asks the manager to
+    review the completed work and produce the project-level final result.
     """
 
     def __init__(
@@ -157,6 +161,7 @@ class ProjectManagerWithStaffOrchestrator:
         self.workflow = workflow
         self.staff_factory = staff_factory
         self.event_recorder = event_recorder or workflow.event_recorder
+        self.manager_control_loop = ManagerControlLoop(self.event_recorder)
 
     def run(self, project: Project) -> ProjectRunResult:
         """Run PM planning, then create recruited staff and child tasks."""
@@ -212,36 +217,15 @@ class ProjectManagerWithStaffOrchestrator:
             child_tasks,
             TaskCompletionHandler(task_store, message_bus, self.event_recorder),
         )
-        completed_at = utc_now()
-        if any(task.status == TaskStatus.FAILED for task in child_tasks):
-            project.status = ProjectStatus.FAILED
-            project.error = ProjectError(
-                type="ChildTaskFailed",
-                message="one or more recruited staff tasks failed",
-            )
-            project.completed_at = completed_at
-            self.event_recorder.project_event(
-                project,
-                "project_failed",
-                project.error.message,
-                level=EventLevel.ERROR,
-                actor_id=manager.id,
-                task_id=manager_task.id,
-            )
-        else:
-            project.status = ProjectStatus.REVIEWING
-            # The CLI run has finished, but the project has not. `Project.completed_at`
-            # is reserved for terminal states such as DONE or FAILED.
-            self.event_recorder.project_event(
-                project,
-                "project_ready_for_review",
-                "All recruited staff tasks completed and await manager review.",
-                actor_id=manager.id,
-                task_id=manager_task.id,
-                data={"completed_child_task_count": len(child_tasks)},
-            )
+        completed_at = self._run_manager_control_loop(
+            project,
+            manager,
+            manager_task,
+            child_tasks,
+            message_bus,
+        )
         logger.info(
-            "project manager with staff orchestration completed worker execution",
+            "project manager with staff orchestration completed",
             extra={
                 "project_id": project.id,
                 "status": project.status.value,
@@ -260,6 +244,252 @@ class ProjectManagerWithStaffOrchestrator:
             events=project.events,
             started_at=started_at,
             completed_at=completed_at,
+        )
+
+    def _run_manager_control_loop(
+        self,
+        project: Project,
+        manager: Staff,
+        manager_task: Task,
+        child_tasks: list[Task],
+        message_bus: InMemoryMessageBus,
+        *,
+        max_rounds: int = 3,
+    ):
+        """Run synchronous manager decisions until the project cannot advance.
+
+        This is not a heartbeat loop yet. It simply gives the orchestrator a
+        repeatable control-loop boundary: decide, apply, inspect terminal or
+        waiting states, and stop before it can spin forever.
+        """
+        completed_at = utc_now()
+        for round_number in range(1, max_rounds + 1):
+            self.event_recorder.project_event(
+                project,
+                "manager_control_round_started",
+                f"Manager control round {round_number} started.",
+                actor_id=manager.id,
+                task_id=manager_task.id,
+                data={"round": round_number},
+            )
+            decision = self.manager_control_loop.decide(project, manager, child_tasks, message_bus)
+            completed_at = self._apply_manager_decision(
+                project,
+                manager,
+                manager_task,
+                child_tasks,
+                decision,
+            )
+            self.event_recorder.project_event(
+                project,
+                "manager_control_round_completed",
+                f"Manager control round {round_number} completed.",
+                actor_id=manager.id,
+                task_id=manager_task.id,
+                data={"round": round_number, "action": decision.action.value},
+            )
+            if project.status in {ProjectStatus.DONE, ProjectStatus.FAILED}:
+                return completed_at
+            if decision.action in {ManagerAction.WAIT, ManagerAction.ASK_USER}:
+                return completed_at
+
+        project.status = ProjectStatus.FAILED
+        project.error = ProjectError(
+            type="ManagerControlLoopLimitReached",
+            message="manager control loop reached max rounds without terminal status",
+        )
+        project.completed_at = completed_at
+        self.event_recorder.project_event(
+            project,
+            "project_failed",
+            project.error.message,
+            level=EventLevel.ERROR,
+            actor_id=manager.id,
+            task_id=manager_task.id,
+            data={"max_rounds": max_rounds},
+        )
+        return completed_at
+
+    def _apply_manager_decision(
+        self,
+        project: Project,
+        manager: Staff,
+        manager_task: Task,
+        child_tasks: list[Task],
+        decision: ManagerDecision,
+    ):
+        """Apply a manager decision through orchestrator-owned state changes."""
+        completed_at = utc_now()
+        if decision.action == ManagerAction.FAIL:
+            project.status = ProjectStatus.FAILED
+            project.error = ProjectError(
+                type="ChildTaskFailed",
+                message=decision.rationale,
+            )
+            project.completed_at = completed_at
+            self.event_recorder.project_event(
+                project,
+                "project_failed",
+                project.error.message,
+                level=EventLevel.ERROR,
+                actor_id=manager.id,
+                task_id=manager_task.id,
+                data={"decision_action": decision.action.value},
+            )
+            return completed_at
+        if decision.action == ManagerAction.WAIT:
+            project.status = ProjectStatus.RUNNING
+            self.event_recorder.project_event(
+                project,
+                "project_waiting",
+                decision.rationale,
+                actor_id=manager.id,
+                task_id=manager_task.id,
+                data={"decision_action": decision.action.value, "task_ids": decision.task_ids},
+            )
+            return completed_at
+        if decision.action == ManagerAction.ASK_USER:
+            project.status = ProjectStatus.RUNNING
+            self.event_recorder.project_event(
+                project,
+                "project_user_input_requested",
+                decision.rationale,
+                actor_id=manager.id,
+                task_id=manager_task.id,
+                data={"decision_action": decision.action.value, "task_ids": decision.task_ids},
+            )
+            return completed_at
+        if decision.action != ManagerAction.REVIEW:
+            project.status = ProjectStatus.FAILED
+            project.error = ProjectError(
+                type="UnsupportedManagerDecision",
+                message=f"unsupported manager decision action: {decision.action.value}",
+            )
+            project.completed_at = completed_at
+            self.event_recorder.project_event(
+                project,
+                "project_failed",
+                project.error.message,
+                level=EventLevel.ERROR,
+                actor_id=manager.id,
+                task_id=manager_task.id,
+            )
+            return completed_at
+
+        review_result = self._run_manager_review(project, manager, manager_task, child_tasks)
+        completed_at = utc_now()
+        if review_result.status == TaskStatus.DONE and review_result.project_result is not None:
+            project.status = ProjectStatus.DONE
+            project.result = review_result.project_result
+            project.staffing_plan = review_result.project_result.staffing_plan
+            project.completed_at = completed_at
+            self.event_recorder.project_event(
+                project,
+                "project_completed",
+                "Project manager reviewed staff work and completed the project.",
+                actor_id=manager.id,
+                data={
+                    "completed_child_task_count": len(child_tasks),
+                    "decision_action": decision.action.value,
+                },
+            )
+            return completed_at
+
+        project.status = ProjectStatus.FAILED
+        project.error = ProjectError(
+            type=review_result.error.type if review_result.error else "ManagerReviewFailed",
+            message=(
+                review_result.error.message
+                if review_result.error
+                else "manager review did not produce a project result"
+            ),
+        )
+        project.completed_at = completed_at
+        self.event_recorder.project_event(
+            project,
+            "project_failed",
+            project.error.message,
+            level=EventLevel.ERROR,
+            actor_id=manager.id,
+            data={"decision_action": decision.action.value},
+        )
+        return completed_at
+
+    def _run_manager_review(
+        self,
+        project: Project,
+        manager: Staff,
+        manager_task: Task,
+        child_tasks: list[Task],
+    ) -> WorkResult:
+        """Ask the project manager to synthesize child task results."""
+        project.status = ProjectStatus.REVIEWING
+        review_task = self._manager_review_task(project, manager, manager_task, child_tasks)
+        project.tasks[review_task.id] = review_task
+        logger.info(
+            "manager review started",
+            extra={
+                "project_id": project.id,
+                "manager_id": manager.id,
+                "task_id": review_task.id,
+                "child_task_count": len(child_tasks),
+            },
+        )
+        self.event_recorder.project_event(
+            project,
+            "project_ready_for_review",
+            "All recruited staff tasks completed and await manager review.",
+            actor_id=manager.id,
+            task_id=review_task.id,
+            data={"completed_child_task_count": len(child_tasks)},
+        )
+        self.event_recorder.project_event(
+            project,
+            "project_review_started",
+            "All recruited staff tasks completed; manager review started.",
+            actor_id=manager.id,
+            task_id=review_task.id,
+            data={"completed_child_task_count": len(child_tasks)},
+        )
+        return self.workflow.run(project, manager, review_task)
+
+    def _manager_review_task(
+        self,
+        project: Project,
+        manager: Staff,
+        manager_task: Task,
+        child_tasks: list[Task],
+    ) -> Task:
+        """Create the PM task that turns worker outputs into a final result."""
+        return Task(
+            project_id=project.id,
+            title="Manager final review",
+            goal=self._manager_review_goal(project, child_tasks),
+            assigned_to=manager.id,
+            created_by=manager.id,
+            parent_task_id=manager_task.id,
+        )
+
+    def _manager_review_goal(self, project: Project, child_tasks: list[Task]) -> str:
+        """Summarize completed child tasks in the task goal for minimal coupling."""
+        if not child_tasks:
+            return (
+                "Review the project plan. No recruited staff tasks were created. "
+                "Produce the final ProjectResult."
+            )
+        task_summaries = "\n".join(
+            (
+                f"- {task.title}: status={task.status.value}; "
+                f"result={task.result or 'no result'}"
+            )
+            for task in child_tasks
+        )
+        return (
+            "Review the completed recruited-staff work below. Decide whether the "
+            "project goal has been satisfied, summarize the result, and produce "
+            "the final ProjectResult.\n\n"
+            f"Project goal:\n{project.goal}\n\n"
+            f"Completed child tasks:\n{task_summaries}"
         )
 
     def _create_recruited_staff_and_tasks(

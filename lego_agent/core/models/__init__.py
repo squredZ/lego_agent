@@ -12,11 +12,19 @@ from lego_agent.core.models.assistant import (
 )
 from lego_agent.core.models.base import new_id, utc_now
 from lego_agent.core.models.capabilities import Capability, Responsibility
+from lego_agent.core.models.control import (
+    ManagerAction,
+    ManagerDecision,
+    ProjectSnapshot,
+    StaffMessageSnapshot,
+    StaffSnapshot,
+    TaskSnapshot,
+)
 from lego_agent.core.models.enums import EventLevel, ProjectStatus, StaffStatus, TaskStatus
 from lego_agent.core.models.errors import ProjectError, TaskError
 from lego_agent.core.models.events import ProjectEvent, TaskEvent
 from lego_agent.core.models.memory import MemoryItem
-from lego_agent.core.models.messages import StaffInbox, StaffMessage
+from lego_agent.core.models.messages import StaffInbox, StaffMessage, StaffMessageType
 from lego_agent.core.models.project import Project, ProjectRunResult
 from lego_agent.core.models.skills import SkillSpec
 from lego_agent.core.models.staff import Staff
@@ -38,6 +46,8 @@ __all__ = [
     "AssistantResponse",
     "Capability",
     "EventLevel",
+    "ManagerAction",
+    "ManagerDecision",
     "MemoryItem",
     "Message",
     "OutputContract",
@@ -46,21 +56,26 @@ __all__ = [
     "ProjectEvent",
     "ProjectResult",
     "ProjectRunResult",
+    "ProjectSnapshot",
     "ProjectStatus",
     "Responsibility",
     "SkillSpec",
     "Staff",
     "StaffInbox",
     "StaffMessage",
+    "StaffMessageSnapshot",
+    "StaffMessageType",
     "StaffProfileMatch",
     "StaffProfileResolution",
     "StaffRolePlan",
+    "StaffSnapshot",
     "StaffStatus",
     "StaffingPlan",
     "Task",
     "TaskError",
     "TaskEvent",
     "TaskExecutionResult",
+    "TaskSnapshot",
     "TaskStatus",
     "ToolCall",
     "ToolResult",

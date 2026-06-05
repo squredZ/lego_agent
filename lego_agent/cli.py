@@ -17,9 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lego-agent")
     parser.add_argument(
         "--log-level",
-        default=os.environ.get("LEGO_AGENT_LOG_LEVEL", "WARNING"),
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set CLI logging level. Can also be set with LEGO_AGENT_LOG_LEVEL.",
+        help="Override logging level. Can also be set by config or LEGO_AGENT_LOG_LEVEL.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = project_subparsers.add_parser("run", help="Run a project goal.")
     run_parser.add_argument(
         "goal",
+        nargs="?",
         help="Project goal.",
     )
     run_parser.add_argument(
@@ -41,18 +42,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--json",
-        action="store_true",
-        help="Print a JSON run result.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Print a JSON run result. Overrides cli.output_json.",
     )
     run_parser.add_argument(
         "--events",
-        action="store_true",
-        help="Include project events in human-readable output.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include project events in human-readable output. Overrides cli.include_events.",
     )
     run_parser.add_argument(
         "--staffing-matches",
-        action="store_true",
-        help="Include planned role to staff profile matches in human-readable output.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include planned role to staff profile matches. Overrides cli.include_staffing_matches.",
     )
     return parser
 
@@ -60,34 +64,42 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args.log_level)
 
     if args.command == "project" and args.project_command == "run":
         try:
+            config = load_project_runtime_config(Path(args.config))
+            log_level = _resolve_log_level(args.log_level, config.cli.log_level)
+            _configure_logging(log_level)
+            goal = _resolve_goal(args.goal, config.project.goal)
+            output_json = _resolve_bool(args.json, config.cli.output_json)
+            include_events = _resolve_bool(args.events, config.cli.include_events)
+            include_staffing_matches = _resolve_bool(
+                args.staffing_matches,
+                config.cli.include_staffing_matches,
+            )
             logger.info(
                 "cli project run started",
                 extra={
                     "config_path": args.config,
-                    "json_output": args.json,
-                    "include_events": args.events,
-                    "include_staffing_matches": args.staffing_matches,
-                    "goal_length": len(args.goal),
+                    "json_output": output_json,
+                    "include_events": include_events,
+                    "include_staffing_matches": include_staffing_matches,
+                    "goal_length": len(goal),
                 },
             )
-            config = load_project_runtime_config(Path(args.config))
             runtime = create_project_runtime(config)
-            run_result = runtime.run(args.goal)
+            run_result = runtime.run(goal)
         except Exception as exc:
             logger.exception("cli project run failed")
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        if args.json:
+        if output_json:
             print(run_result.model_dump_json(indent=2))
         else:
             _print_human_result(
                 run_result,
-                include_events=args.events,
-                include_staffing_matches=args.staffing_matches,
+                include_events=include_events,
+                include_staffing_matches=include_staffing_matches,
             )
         logger.info(
             "cli project run completed",
@@ -97,6 +109,24 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"unsupported command: {args.command}")
     return 2
+
+
+def _resolve_log_level(cli_value: str | None, config_value: str | None) -> str:
+    """Resolve log level from CLI, config, env var, then a quiet default."""
+    return cli_value or config_value or os.environ.get("LEGO_AGENT_LOG_LEVEL", "WARNING")
+
+
+def _resolve_goal(cli_value: str | None, config_value: str | None) -> str:
+    """Use CLI goal when provided, otherwise fall back to config project.goal."""
+    goal = cli_value or config_value
+    if not goal:
+        raise ValueError("project goal is required; pass it on the CLI or set project.goal in config")
+    return goal
+
+
+def _resolve_bool(cli_value: bool | None, config_value: bool) -> bool:
+    """Let explicit CLI booleans override config defaults."""
+    return config_value if cli_value is None else cli_value
 
 
 def _configure_logging(level_name: str) -> None:

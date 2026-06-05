@@ -1,6 +1,13 @@
 {
   "project": {
-    "default_manager_profile": "project_manager"
+    "default_manager_profile": "project_manager",
+    "goal": "请为一个项目化 agent 框架制定初始计划"
+  },
+  "cli": {
+    "log_level": "INFO",
+    "output_json": false,
+    "include_events": true,
+    "include_staffing_matches": true
   },
   "orchestration": {
     "strategy": "project_manager_only"

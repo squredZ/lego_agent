@@ -8,6 +8,7 @@ from lego_agent.core.models import (
     Project,
     Staff,
     StaffMessage,
+    StaffMessageType,
     Task,
     TaskStatus,
     WorkResult,
@@ -174,7 +175,7 @@ class TaskDispatcher:
                 project_id=project.id,
                 sender_id=created_by.id,
                 recipient_id=assignee.id,
-                type="task_assigned",
+                type=StaffMessageType.TASK_ASSIGNED,
                 task_id=task.id,
                 content=f"You have been assigned task '{task.title}'.",
             )
@@ -220,6 +221,11 @@ class TaskCompletionHandler:
 
         event_level = EventLevel.ERROR if result.status == TaskStatus.FAILED else EventLevel.INFO
         event_type = "task_failed" if result.status == TaskStatus.FAILED else "task_completed"
+        message_type = (
+            StaffMessageType.TASK_FAILED
+            if result.status == TaskStatus.FAILED
+            else StaffMessageType.TASK_COMPLETED
+        )
         self.event_recorder.project_event(
             project,
             event_type,
@@ -240,12 +246,13 @@ class TaskCompletionHandler:
                 project_id=project.id,
                 sender_id=staff.id,
                 recipient_id=project.manager_id,
-                type=event_type,
+                type=message_type,
                 task_id=task.id,
                 content=f"Task '{task.title}' finished with status '{result.status.value}'.",
                 data={"status": result.status.value},
             )
         )
+        self._report_blockers(project, task, staff, result)
         logger.info(
             "task completion handled",
             extra={
@@ -256,3 +263,170 @@ class TaskCompletionHandler:
             },
         )
         return updated_task
+
+    def _report_blockers(
+        self,
+        project: Project,
+        task: Task,
+        staff: Staff,
+        result: WorkResult,
+    ) -> None:
+        """Notify the manager when structured staff output contains blockers."""
+        blockers = result.task_result.blockers if result.task_result else []
+        if not blockers:
+            return
+        message = self.message_bus.send(
+            StaffMessage(
+                project_id=project.id,
+                sender_id=staff.id,
+                recipient_id=project.manager_id,
+                type=StaffMessageType.BLOCKER_REPORTED,
+                task_id=task.id,
+                content="\n".join(blockers),
+                data={"blocker_count": len(blockers)},
+            )
+        )
+        self.event_recorder.project_event(
+            project,
+            "staff_blocker_reported",
+            f"Staff '{staff.id}' reported {len(blockers)} blocker(s).",
+            level=EventLevel.WARNING,
+            actor_id=staff.id,
+            task_id=task.id,
+            data={"message_id": message.id, "blocker_count": len(blockers)},
+        )
+        logger.info(
+            "staff blockers reported",
+            extra={
+                "project_id": project.id,
+                "task_id": task.id,
+                "staff_id": staff.id,
+                "blocker_count": len(blockers),
+            },
+        )
+
+
+class StaffCommunicationService:
+    """Business-facing API for staff-to-staff messages.
+
+    Staff members still do not call each other directly. They publish messages
+    through MessageBus, and project events make the communication observable.
+    """
+
+    def __init__(self, message_bus: MessageBus, event_recorder: EventRecorder) -> None:
+        self.message_bus = message_bus
+        self.event_recorder = event_recorder
+
+    def send(
+        self,
+        project: Project,
+        sender: Staff,
+        recipient: Staff,
+        message_type: StaffMessageType,
+        content: str,
+        *,
+        task: Task | None = None,
+        data: dict | None = None,
+    ) -> StaffMessage:
+        """Send one staff message and record a redacted project event."""
+        self._validate_staff(project, sender)
+        self._validate_staff(project, recipient)
+        if task is not None and task.project_id != project.id:
+            raise ValueError(f"task '{task.id}' does not belong to project '{project.id}'")
+
+        message = self.message_bus.send(
+            StaffMessage(
+                project_id=project.id,
+                sender_id=sender.id,
+                recipient_id=recipient.id,
+                type=message_type,
+                task_id=task.id if task else None,
+                content=content,
+                data=data or {},
+            )
+        )
+        self.event_recorder.project_event(
+            project,
+            "staff_message_sent",
+            f"Staff '{sender.id}' sent '{message_type.value}' to '{recipient.id}'.",
+            actor_id=sender.id,
+            task_id=task.id if task else None,
+            data={
+                "message_id": message.id,
+                "message_type": message_type.value,
+                "recipient_id": recipient.id,
+            },
+        )
+        logger.info(
+            "staff communication sent",
+            extra={
+                "project_id": project.id,
+                "message_id": message.id,
+                "message_type": message_type.value,
+                "sender_id": sender.id,
+                "recipient_id": recipient.id,
+                "task_id": task.id if task else None,
+            },
+        )
+        return message
+
+    def ask_question(
+        self,
+        project: Project,
+        sender: Staff,
+        recipient: Staff,
+        question: str,
+        *,
+        task: Task | None = None,
+    ) -> StaffMessage:
+        """Send a question to another staff member."""
+        return self.send(
+            project,
+            sender,
+            recipient,
+            StaffMessageType.QUESTION,
+            question,
+            task=task,
+        )
+
+    def request_help(
+        self,
+        project: Project,
+        sender: Staff,
+        recipient: Staff,
+        request: str,
+        *,
+        task: Task | None = None,
+    ) -> StaffMessage:
+        """Ask another staff member for support without changing task state."""
+        return self.send(
+            project,
+            sender,
+            recipient,
+            StaffMessageType.HELP_REQUESTED,
+            request,
+            task=task,
+        )
+
+    def report_blocker(
+        self,
+        project: Project,
+        sender: Staff,
+        recipient: Staff,
+        blocker: str,
+        *,
+        task: Task | None = None,
+    ) -> StaffMessage:
+        """Notify another staff member about a blocker or unresolved issue."""
+        return self.send(
+            project,
+            sender,
+            recipient,
+            StaffMessageType.BLOCKER_REPORTED,
+            blocker,
+            task=task,
+        )
+
+    def _validate_staff(self, project: Project, staff: Staff) -> None:
+        if staff.project_id != project.id or staff.id not in project.staff:
+            raise ValueError(f"staff '{staff.id}' does not belong to project '{project.id}'")

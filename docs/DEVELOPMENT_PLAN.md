@@ -21,7 +21,18 @@ project goal
   -> create and dispatch child Tasks
   -> execute child Tasks through SinglePassStaffWorkflow
   -> TaskExecutionResult for each child Task
+  -> project manager review Task
+  -> final ProjectResult
   -> ProjectRunResult
+```
+
+Current orchestration limitation:
+
+```text
+project_manager_with_staff is still stage-based and synchronous.
+Worker staff tasks run serially.
+The project manager plans once, reviews once, and does not yet run a
+continuous ManagerControlLoop.
 ```
 
 Optional V2B iterative workflow:
@@ -40,6 +51,8 @@ Staff task
 
 Current documentation state:
 
+- `docs/AGENT_FRAMEWORK_REDESIGN_CN.md` is the Chinese re-review design
+  document and should be treated as the main conceptual entry point.
 - `docs/PROJECT_AGENT_DESIGN.md` describes the project-oriented runtime and
   staff workflow design.
 - `docs/CLI_CALL_FLOW.md` explains the CLI startup and runtime call chain.
@@ -56,7 +69,7 @@ Verified commands:
 Current test result:
 
 ```text
-49 passed
+64 passed
 ```
 
 ## Version 1 Scope
@@ -349,6 +362,12 @@ Implemented:
 lego-agent project run --config configs/project_runtime.json "project goal"
 ```
 
+Also supported when `project.goal` is set in config:
+
+```bash
+lego-agent project run
+```
+
 Also supported:
 
 ```bash
@@ -360,6 +379,13 @@ Runtime logs can be enabled from the CLI:
 ```bash
 lego-agent --log-level INFO project run --config configs/project_runtime.json "project goal"
 ```
+
+CLI defaults can be stored in config under `cli`:
+
+- `log_level`
+- `output_json`
+- `include_events`
+- `include_staffing_matches`
 
 Human output includes:
 
@@ -374,6 +400,7 @@ Acceptance status:
 
 - CLI dry-run works through installed entry point.
 - JSON output is a valid `ProjectRunResult`.
+- CLI can read the project goal and output preferences from config.
 
 ### Phase 7: Tests
 
@@ -467,9 +494,9 @@ These are intentionally not blocking Version 1, but should be addressed soon.
    - V2B iterative validation retries are implemented.
    - Provider-native structured output support is still deferred.
 
-3. Tool execution is implemented but tool registration is still too centralized.
-   - `BuiltinToolManager` currently owns the first built-in tool implementations.
-   - Next step is V2B-3: introduce a `Tool` protocol and `ToolRegistry`.
+3. Tool execution and basic registration are implemented.
+   - `BuiltinToolManager` delegates concrete behavior to `ToolRegistry`.
+   - More built-in tools still need to be added after the core workflow stabilizes.
 
 4. Workflow/orchestrator/skill/output parser registries are deferred.
    - Current code has stable classes but not full registries for every extension point.
@@ -573,11 +600,12 @@ Configured staff profiles are reusable templates, not a whitelist.
 
 ### Version 2A: Synchronous Multi-Staff Semantics
 
-Status: in progress. Foundation models, in-memory collaboration components,
-staffing bootstrap, and synchronous worker execution are implemented. Manager
-review is still pending.
+Status: complete for synchronous Version 2A semantics.
 
 Objective: model multi-staff collaboration without real concurrency.
+This phase intentionally executes child staff tasks serially. Its purpose is
+to validate staff creation, task assignment, task completion, events, messages,
+and final manager review before introducing concurrent workers.
 
 Tasks:
 
@@ -610,7 +638,11 @@ Tasks:
 9. Child task completion updates task state, emits task events, and sends manager inbox messages.
    Status: done for synchronous `project_manager_with_staff` execution.
 10. Manager reviews after all child tasks complete.
-   Status: pending.
+   Status: done.
+11. Add business-facing staff communication service for questions, help requests, and blocker reports.
+   Status: done.
+12. Report `TaskExecutionResult.blockers` to the project manager through `MessageBus`.
+   Status: done.
 
 Acceptance:
 
@@ -622,7 +654,86 @@ Acceptance:
   - task event
   - manager inbox message
 - Manager final review uses task state as source of truth.
+- Staff can communicate through `MessageBus` without directly calling each other.
+- Staff messages can express questions, help requests, blocker reports, and task notifications.
+- Structured task blockers automatically become manager-visible `blocker_reported` messages.
 - Existing PM-only mode remains supported.
+
+### Version 2A-2: Manager Control Loop
+
+Status: in progress. The first deterministic synchronous decision slice is
+implemented. True multi-round manager looping is still pending.
+
+Objective: move the project manager from stage-based single planning/review
+into a controlled multi-round decision loop. A heartbeat is only one possible
+trigger; the core abstraction is a manager loop that collects project state and
+returns structured decisions.
+
+Design rule:
+
+```text
+Manager decides; orchestrator applies.
+The manager should not directly mutate Project, Staff, or Task objects.
+```
+
+Planned loop:
+
+```text
+collect project snapshot
+  -> collect task states
+  -> collect staff statuses
+  -> collect events/messages
+  -> manager produces ManagerDecision
+  -> orchestrator applies allowed action
+  -> repeat until DONE or FAILED
+```
+
+Trigger strategy:
+
+1. First implementation: synchronous loop inside the orchestrator.
+2. Later: event-triggered loop when task/user/tool events arrive.
+3. Later: heartbeat trigger as a fallback for long-running work.
+4. Final direction: hybrid event + heartbeat control.
+
+Initial `ManagerDecision` actions:
+
+- `wait`
+- `assign_task`
+- `review`
+- `finish`
+- `fail`
+- `ask_user`
+
+Tasks:
+
+1. Add project snapshot model for manager review.
+   Status: done.
+2. Add `ManagerDecision` model.
+   Status: done.
+3. Add a synchronous `ManagerControlLoop` service.
+   Status: done for deterministic `wait`/`review`/`fail` decisions.
+4. Update `ProjectManagerWithStaffOrchestrator` to use the loop after initial staffing.
+   Status: done for one decision after serial worker execution.
+5. Record events for each manager decision and applied action.
+   Status: done for `manager_decision_made` and applied project events.
+6. Add tests for wait/review/finish/fail paths.
+   Status: partially done for `wait`, `review`, and `fail`; `finish` remains tied to manager review success.
+7. Add repeated manager loop rounds until `DONE` or `FAILED`.
+   Status: done for synchronous control rounds that stop on terminal, wait, or user-input states.
+8. Add `assign_task` and `ask_user` decision application.
+   Status: partially done. `ask_user` is applied as `project_user_input_requested`; `assign_task` remains pending.
+9. Add unread staff message summaries to manager snapshots.
+   Status: done.
+10. Let manager decisions react to staff questions, help requests, and blocker reports.
+   Status: done for deterministic `ask_user` decisions.
+
+Acceptance:
+
+- The project manager can make more than one decision after initial planning.
+- Decisions are based on task state, staff status, events, and messages.
+- The orchestrator remains the only component that applies state changes.
+- The implementation remains synchronous; no background heartbeat is required yet.
+- Future asyncio and heartbeat work can reuse the same decision model.
 
 ### Version 2B: Iterative Staff Workflow
 
@@ -693,11 +804,11 @@ Tasks:
 
 V2B-3: Tool Registry Refactor.
 
-Status: pending.
+Status: complete.
 
-The current V2B-2 implementation keeps the first built-in tools inside
-`BuiltinToolManager` as a minimal working implementation. The next refactor
-should make tools extensible without continuing to grow that class.
+The first built-in tools now live behind a `Tool` protocol and `ToolRegistry`.
+`BuiltinToolManager` keeps the workflow-facing policy and delegates concrete
+tool behavior to registered Tool implementations.
 
 Tasks:
 
@@ -706,17 +817,17 @@ Tasks:
    - `description`
    - `parameters_schema`
    - `call(arguments) -> ToolResult`
-   Status: pending.
+   Status: done.
 2. Add `ToolRegistry`.
-   Status: pending.
+   Status: done.
 3. Extract `EchoTool`.
-   Status: pending.
+   Status: done.
 4. Extract `ReadProjectFileTool`.
-   Status: pending.
+   Status: done.
 5. Make `BuiltinToolManager` delegate to `ToolRegistry`.
-   Status: pending.
+   Status: done.
 6. Keep existing `enabled_tools`, logging, structured `ToolResult`, and workspace safety behavior unchanged.
-   Status: pending.
+   Status: done.
 
 V2B-3 acceptance:
 
@@ -737,6 +848,8 @@ Version 2B acceptance:
 ### Version 2C: Asyncio Concurrent Staff Execution
 
 Objective: make staff task execution concurrent while keeping the same state/message abstractions.
+This should come after the synchronous Manager Control Loop, otherwise workers
+can run concurrently but the project manager still only reacts at the end.
 
 Tasks:
 
@@ -745,6 +858,8 @@ Tasks:
 3. Keep `TaskStore` as source of truth.
 4. Use events/messages for notification.
 5. Add timeout and failure handling.
+6. Trigger manager analysis from task completion/failure events.
+7. Add heartbeat-based manager checks as a fallback for long-running tasks.
 
 Acceptance:
 

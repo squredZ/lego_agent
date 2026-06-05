@@ -3,12 +3,22 @@
 This document explains what happens after running:
 
 ```bash
+lego-agent project run
+```
+
+The project goal and output preferences can come from
+`configs/project_runtime.json`. The CLI can still override them:
+
+```bash
 lego-agent project run --config configs/project_runtime.json "Build a configurable agent framework"
 ```
 
 ## Summary
 
-The CLI receives a project goal, loads runtime config, creates a `Project`, creates one primary project manager `Staff`, creates one planning `Task`, runs the unified `SinglePassStaffWorkflow`, parses a structured `ProjectResult`, and prints a `ProjectRunResult`.
+The CLI loads runtime config, resolves a project goal from the command line or
+`project.goal`, creates a `Project`, creates one primary project manager
+`Staff`, creates one planning `Task`, runs the unified `SinglePassStaffWorkflow`,
+parses a structured `ProjectResult`, and prints a `ProjectRunResult`.
 
 ## Full Call Chain
 
@@ -68,9 +78,9 @@ The CLI parses:
 
 - command: `project run`
 - config path: `configs/project_runtime.json`
-- project goal: the final positional argument
-- output options: `--json`, `--events`, `--staffing-matches`
-- logging option: `--log-level`, or `LEGO_AGENT_LOG_LEVEL`
+- project goal: final positional argument, or `project.goal` in config
+- output options: CLI flags, or `cli` defaults in config
+- logging option: `--log-level`, `cli.log_level`, or `LEGO_AGENT_LOG_LEVEL`
 
 ### 2. Config Loading
 
@@ -89,6 +99,7 @@ ProjectRuntimeConfig
 The important config sections are:
 
 - project defaults
+- CLI defaults
 - orchestration strategy
 - staff profiles
 - assistant settings

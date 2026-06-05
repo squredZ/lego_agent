@@ -14,6 +14,7 @@ from lego_agent.core.models import (
     ToolSpec,
     WorkContext,
 )
+from lego_agent.workflow.tools import ToolRegistry, create_builtin_tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -109,20 +110,21 @@ class NoopToolManager:
 
 
 class BuiltinToolManager:
-    """Executes small built-in tools through one controlled boundary.
+    """Executes registered built-in tools through one controlled boundary.
 
-    The first tools intentionally follow a narrow Codex-style shape: explicit
-    schemas, workspace safety for file reads, structured ToolResult values, and
-    no direct workflow access to implementation details.
+    The manager is responsible for workflow-facing policy: which tools are
+    enabled, how calls are logged, and how unknown or disabled calls fail. The
+    concrete tool behavior lives in Tool classes registered in ToolRegistry.
     """
 
     def __init__(
         self,
         workspace_root: Path | str | None = None,
         enabled_tools: list[str] | None = None,
+        registry: ToolRegistry | None = None,
     ) -> None:
-        self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
-        self.enabled_tools = set(enabled_tools or ["echo", "read_project_file"])
+        self.registry = registry or create_builtin_tool_registry(workspace_root=workspace_root)
+        self.enabled_tools = set(enabled_tools or self.registry.names())
 
     def list_tools(self, staff: Staff, task: Task) -> list[ToolSpec]:
         logger.debug(
@@ -134,27 +136,7 @@ class BuiltinToolManager:
                 "tool_count": len(self.enabled_tools),
             },
         )
-        specs = {
-            "echo": ToolSpec(
-                name="echo",
-                description="Return the provided text. Useful for deterministic tool-loop tests.",
-                parameters_schema={
-                    "type": "object",
-                    "properties": {"text": {"type": "string"}},
-                    "required": ["text"],
-                },
-            ),
-            "read_project_file": ToolSpec(
-                name="read_project_file",
-                description="Read a UTF-8 text file inside the current workspace.",
-                parameters_schema={
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-            ),
-        }
-        return [spec for name, spec in specs.items() if name in self.enabled_tools]
+        return self.registry.list_specs(self.enabled_tools)
 
     def call_tool(self, call: ToolCall) -> ToolResult:
         logger.info("builtin tool call started", extra={"tool_name": call.tool_name})
@@ -164,59 +146,7 @@ class BuiltinToolManager:
                 success=False,
                 error=f"tool '{call.tool_name}' is not enabled",
             )
-        if call.tool_name == "echo":
-            return self._echo(call)
-        if call.tool_name == "read_project_file":
-            return self._read_project_file(call)
-        return ToolResult(
-            tool_name=call.tool_name,
-            success=False,
-            error=f"tool '{call.tool_name}' is not implemented",
-        )
-
-    def _echo(self, call: ToolCall) -> ToolResult:
-        text = call.arguments.get("text", "")
-        content = str(text)
-        logger.info("builtin echo completed", extra={"content_length": len(content)})
-        return ToolResult(tool_name=call.tool_name, success=True, content=content)
-
-    def _read_project_file(self, call: ToolCall) -> ToolResult:
-        raw_path = call.arguments.get("path")
-        if not isinstance(raw_path, str) or not raw_path:
-            return ToolResult(
-                tool_name=call.tool_name,
-                success=False,
-                error="'path' must be a non-empty string",
-            )
-        candidate = (self.workspace_root / raw_path).resolve()
-        if not self._is_inside_workspace(candidate):
-            logger.warning("blocked file read outside workspace", extra={"tool_name": call.tool_name})
-            return ToolResult(
-                tool_name=call.tool_name,
-                success=False,
-                error="path is outside the workspace",
-            )
-        try:
-            content = candidate.read_text(encoding="utf-8")
-        except OSError as exc:
-            return ToolResult(
-                tool_name=call.tool_name,
-                success=False,
-                error=str(exc),
-            )
-        logger.info(
-            "builtin read_project_file completed",
-            extra={"path": str(candidate.relative_to(self.workspace_root)), "content_length": len(content)},
-        )
-        return ToolResult(
-            tool_name=call.tool_name,
-            success=True,
-            content=content,
-            data={"path": str(candidate.relative_to(self.workspace_root))},
-        )
-
-    def _is_inside_workspace(self, path: Path) -> bool:
-        return path == self.workspace_root or self.workspace_root in path.parents
+        return self.registry.call(call)
 
 
 class NoopSkillManager:

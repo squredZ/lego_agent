@@ -1285,8 +1285,9 @@ not the final authority.
 ### 11.2 Project Manager With Staff Execution
 
 `project_manager_with_staff` starts Version 2A with synchronous worker
-execution. It still does not perform manager final review; when child tasks
-finish successfully, the project moves to `reviewing`.
+execution. After child tasks finish successfully, the project manager receives
+a review task, synthesizes the worker outputs, and produces the final
+`ProjectResult`.
 
 Current behavior:
 
@@ -1299,7 +1300,8 @@ Current behavior:
 7. Execute each child task through `SinglePassStaffWorkflow`.
 8. Parse worker output as `TaskExecutionResult`.
 9. Complete each task through `TaskCompletionHandler`.
-10. Stop with project status `reviewing`.
+10. Create and execute a project manager review task.
+11. Store the reviewed `ProjectResult` and finish with project status `done`.
 
 ```mermaid
 graph TD
@@ -1313,7 +1315,9 @@ graph TD
     Dispatch --> RunWorkers[Run Worker StaffWorkflow]
     RunWorkers --> TaskResult[Parse TaskExecutionResult]
     TaskResult --> CompleteTasks[Complete Tasks And Notify Manager]
-    CompleteTasks --> Reviewing[Project status REVIEWING]
+    CompleteTasks --> ReviewTask[Create PM Review Task]
+    ReviewTask --> RunReview[Run PM StaffWorkflow]
+    RunReview --> Done[Project status DONE]
 ```
 
 ### 11.3 Project Manager Only Orchestration

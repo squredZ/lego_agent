@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr, model_validator
 
@@ -71,6 +71,20 @@ class ProjectDefaultsConfig(BaseModel):
     """Project-level defaults shared by all runs using this config."""
 
     default_manager_profile: str = "project_manager"
+    goal: str | None = None
+
+
+class CliConfig(BaseModel):
+    """Default command-line behavior for this runtime config.
+
+    These options keep day-to-day commands short. CLI flags can still override
+    them when a run needs a different output shape or log level.
+    """
+
+    output_json: bool = False
+    include_events: bool = False
+    include_staffing_matches: bool = False
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None = None
 
 
 class StaffProfileConfig(BaseModel):
@@ -117,6 +131,7 @@ class ProjectRuntimeConfig(BaseModel):
     """Top-level runtime configuration loaded from JSON."""
 
     project: ProjectDefaultsConfig = Field(default_factory=ProjectDefaultsConfig)
+    cli: CliConfig = Field(default_factory=CliConfig)
     orchestration: OrchestrationConfig = Field(default_factory=OrchestrationConfig)
     workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
     staff_profiles: dict[str, StaffProfileConfig]

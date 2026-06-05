@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from lego_agent.core.models.base import new_id, utc_now
+
+
+class StaffMessageType(StrEnum):
+    """Stable message categories used for staff-to-staff communication."""
+
+    TASK_ASSIGNED = "task_assigned"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    QUESTION = "question"
+    HELP_REQUESTED = "help_requested"
+    BLOCKER_REPORTED = "blocker_reported"
+    STATUS_UPDATE = "status_update"
 
 
 class StaffMessage(BaseModel):
@@ -19,7 +32,7 @@ class StaffMessage(BaseModel):
     project_id: str = Field(description="Project this message belongs to.")
     sender_id: str = Field(description="Staff or system actor that sent the message.")
     recipient_id: str = Field(description="Staff id that should receive the message.")
-    type: str = Field(description="Message type such as task_assigned or task_completed.")
+    type: StaffMessageType = Field(description="Message type such as task_assigned or question.")
     content: str = Field(description="Human-readable message body.")
     task_id: str | None = Field(default=None, description="Related task id, if any.")
     data: dict[str, Any] = Field(default_factory=dict, description="Structured message metadata.")
